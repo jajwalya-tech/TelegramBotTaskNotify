@@ -61,6 +61,7 @@ const poolConfig = {
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
   idleTimeoutMillis: DB_IDLE_TIMEOUT,
   max: DB_MAX_CONNECTIONS,
+  host: 'db.zycqtvzahzqutfrvykuv.supabase.co' // ← ADD THIS LINE
 };
 
 if (process.env.DB_SSL === 'true') {
