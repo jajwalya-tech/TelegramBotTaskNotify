@@ -76,6 +76,7 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 /* -------------------------
    Database: init tables
    ------------------------- */
+
 async function initTables() {
   const client = await pool.connect();
   try {
@@ -644,12 +645,33 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
+// Add this function BEFORE the main function
+async function testConnection() {
+  try {
+    const client = await pool.connect();
+    console.log('✅ Successfully connected to Supabase database!');
+    console.log('📍 Host: db.sjxcfetwrzejxohskeft.supabase.co');
+    client.release();
+    return true;
+  } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
+    return false;
+  }
+}
+
 /* -------------------------
    Startup sequence
    ------------------------- */
 
 (async function main() {
   try {
+    // Test connection first
+    const connected = await testConnection();
+    if (!connected) {
+      console.error('Cannot start without database connection');
+      process.exit(1);
+    }
+    
     await initTables();
     // small delay to ensure DB is ready; then reschedule
     setTimeout(rescheduleAll, 2000);
