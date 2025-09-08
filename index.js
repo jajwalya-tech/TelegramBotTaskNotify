@@ -1,27 +1,10 @@
 /**
- * Telegram Task/Reminder Bot
+ * Telegram Task/Reminder Bot - Full ready-to-run file
  *
- * Patches applied:
- *  - Fix /settime parsing (split only on first colon)
- *  - Message queue concurrency guard (processing flag)
- *  - Send CSV as Buffer (no disk file I/O)
- *  - SIGINT + SIGTERM handlers for graceful shutdown
- *  - Pool SSL optional via DB_SSL env var
- *  - Auto-create user row on /addtask to avoid FK errors
- *
- * ENV VARS (required):
- *   BOT_TOKEN        - Telegram bot token
- *   DATABASE_URL     - Postgres connection string
- *
- * Optional ENV VARS:
- *   DEFAULT_TIMEZONE - e.g. "Asia/Kolkata" (default: Asia/Kolkata)
- *   MSG_INTERVAL_MS  - queue polling interval in ms (default: 300)
- *   DB_SSL           - "true" to enable ssl: { rejectUnauthorized: false }
- *   DB_CONNECTION_TIMEOUT, DB_IDLE_TIMEOUT, DB_MAX_CONNECTIONS - pool tuning
- *
- * Deployment:
- *   - If you keep polling: run as a Background Worker / Daemon (Render).
- *   - If you prefer webhook mode, convert to webhook and run as Web Service.
+ * Notes:
+ * - Fixed DB connection: no monkey-patching of Pool.prototype.connect.
+ * - Use env vars BOT_TOKEN and DATABASE_URL (required).
+ * - Optional: DEFAULT_TIMEZONE, MSG_INTERVAL_MS, DB_SSL, DB_CONNECTION_TIMEOUT, DB_IDLE_TIMEOUT, DB_MAX_CONNECTIONS
  */
 
 require('dotenv').config();
@@ -32,9 +15,8 @@ const { CronJob } = require('cron');
 const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
-const { stringify } = require('csv-stringify/sync'); // sync stringify for simplicity
-// Note: csv-stringify also exports async versions; using sync avoids callback nesting
-// but keep output sizes reasonable.
+const { stringify } = require('csv-stringify/sync');
+
 dayjs.extend(utc);
 dayjs.extend(tz);
 
@@ -53,53 +35,22 @@ if (!DATABASE_URL) {
 const DEFAULT_TZ = process.env.DEFAULT_TIMEZONE || 'Asia/Kolkata';
 const MSG_INTERVAL_MS = Number(process.env.MSG_INTERVAL_MS || 300);
 const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000); // 10 seconds
-const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000); // 30 seconds  
-const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 3); // Conservative for Supabas
+const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000); // 30 seconds
+const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 3);
 
-
-const dns = require('dns');
-const { promisify } = require('util');
-
-// Custom function to resolve hostname to IPv4
-async function resolveIPv4(hostname) {
-  try {
-    const resolve4 = promisify(dns.resolve4);
-    const addresses = await resolve4(hostname);
-    return addresses[0]; // Return the first IPv4 address
-  } catch (err) {
-    console.error('DNS resolution failed:', err.message);
-    return hostname; // Fall back to hostname
-  }
-}
-
-// Parse the database URL to extract components
+// Parse DB URL and build pool config (no monkey-patch)
 const { URL } = require('url');
-const dbUrl = new URL(process.env.DATABASE_URL);
+const dbUrl = new URL(DATABASE_URL);
 
-// Create pool configuration with custom connection logic
 const poolConfig = {
   user: dbUrl.username,
   password: dbUrl.password,
-  host: dbUrl.hostname, // Will be resolved to IPv4
+  host: dbUrl.hostname,
   port: dbUrl.port || 5432,
   database: dbUrl.pathname.replace('/', ''),
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
   idleTimeoutMillis: DB_IDLE_TIMEOUT,
   max: DB_MAX_CONNECTIONS,
-};
-
-// Override the connection logic to force IPv4
-const originalConnect = Pool.prototype.connect;
-Pool.prototype.connect = function(callback) {
-  // Resolve host to IPv4 before connecting
-  resolveIPv4(this.options.host).then(ipv4Address => {
-    this.options.host = ipv4Address;
-    console.log('Connecting to database at:', ipv4Address);
-    originalConnect.call(this, callback);
-  }).catch(err => {
-    console.error('Failed to resolve IPv4 address:', err);
-    callback(err);
-  });
 };
 
 if (process.env.DB_SSL === 'true') {
@@ -108,6 +59,7 @@ if (process.env.DB_SSL === 'true') {
 
 const pool = new Pool(poolConfig);
 
+// Create the bot (polling). It's safe because pool is created above.
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 /* -------------------------
@@ -129,7 +81,6 @@ async function initTables() {
       );
     `);
 
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_chat_date ON tasks(chat_id, date);`).catch(()=>{});
     await client.query(`
       CREATE TABLE IF NOT EXISTS tasks (
         id SERIAL PRIMARY KEY,
@@ -143,6 +94,7 @@ async function initTables() {
       );
     `);
 
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_chat_date ON tasks(chat_id, date);`).catch(()=>{});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(date);`).catch(()=>{});
     console.log('DB: tables ensured.');
   } catch (err) {
@@ -154,7 +106,7 @@ async function initTables() {
 }
 
 /* -------------------------
-   Messages templates
+   Message templates
    ------------------------- */
 
 const messages =  {
@@ -184,13 +136,12 @@ const messages =  {
     '🌠 Evening focus, {name}.\n\n“Try to be a rainbow in someone’s cloud.” — Maya Angelou',
   ],
   endOfDay: [
-  '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Peace comes from within. Do not seek it without.” — Buddha',
-  '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Do not go where the path may lead, go instead where there is no path and leave a trail.” — Ralph Waldo Emerson',
-  '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“The wound is the place where the Light enters you.” — Rumi',
-  '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.” — Claude Monet',
-  '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Happiness is not something ready made. It comes from your own actions.” — Dalai Lama',
-],
-
+    '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Peace comes from within. Do not seek it without.” — Buddha',
+    '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Do not go where the path may lead, go instead where there is no path and leave a trail.” — Ralph Waldo Emerson',
+    '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“The wound is the place where the Light enters you.” — Rumi',
+    '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.” — Claude Monet',
+    '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Happiness is not something ready made. It comes from your own actions.” — Dalai Lama',
+  ],
 };
 
 function pickMessage(type, name = '', tasksStr = '') {
@@ -208,7 +159,6 @@ function localDateStr(tzName = DEFAULT_TZ, offsetDays = 0) {
 }
 
 function parseTimeHHMM(value) {
-  // Accept "HH:MM" 24-hour format
   if (!value || typeof value !== 'string') return null;
   const m = value.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
   if (!m) return null;
@@ -236,13 +186,11 @@ async function processQueueTick() {
     await bot.sendMessage(item.chatId, item.text, item.opts);
     messageQueue.shift();
   } catch (err) {
-    // If Telegram returns 403 (bot blocked) or 400 user not found, drop and cleanup schedules
     console.error('sendMessage error for', item.chatId, err.message || err);
     item.retries = (item.retries || 0) + 1;
-    if (item.retries >= 3 || (err.response && [400,403,404].includes(err.response.statusCode))) {
+    if (item.retries >= 3 || (err.response && [400, 403, 404].includes(err.response.statusCode))) {
       console.warn(`Dropping message for ${item.chatId} after ${item.retries} retries.`);
       messageQueue.shift();
-      // If bot was blocked (403), remove scheduled jobs for that chat to avoid future retries
       if (err.response && err.response.statusCode === 403) {
         clearJobs(item.chatId);
       }
@@ -277,7 +225,7 @@ function pushJob(chatId, job) {
 
 /**
  * Convert "HH:MM" to cron pattern for daily at that time in local timezone
- * Cron: 'm H * * *' with second optional
+ * Cron: 'm H * * *'
  */
 function cronPatternForHHMM(hhmm) {
   const [hh, mm] = hhmm.split(':');
@@ -539,8 +487,7 @@ bot.onText(/\/noreason (.+)/, async (msg, match) => {
  * Example usage:
  *   /settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00
  *
- * This handler will parse using only first colon as separator so times with ':'
- * remain intact.
+ * This handler will parse using only first colon as separator so times with ':' remain intact.
  */
 bot.onText(/\/settime (.+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
@@ -565,14 +512,11 @@ bot.onText(/\/settime (.+)/, async (msg, match) => {
   if (!Object.keys(newSessions).length) return bot.sendMessage(chatId, 'No valid time entries found.');
 
   try {
-    // load user, update sessions
     await pool.query(`INSERT INTO users (chat_id, timezone, sessions, created_at, updated_at) VALUES ($1,$2,$3,NOW(),NOW()) ON CONFLICT (chat_id) DO UPDATE SET sessions = $3, updated_at = NOW()`, [chatId, DEFAULT_TZ, JSON.stringify(newSessions)]);
-    // refresh schedule
     clearJobs(chatId);
     const { rows } = await pool.query(`SELECT * FROM users WHERE chat_id=$1`, [chatId]);
     const user = rows[0];
     if (user) {
-      // merge sessions: keep missing keys from prior sessions or defaults
       user.sessions = Object.assign({
         startOfDay: '07:00',
         morning: '08:30',
@@ -630,6 +574,7 @@ bot.onText(/\/report (weekly|monthly)/, async (msg, match) => {
     });
     const fileName = `report_${chatId}_${type}_${dayjs().format('YYYYMMDD_HHmmss')}.csv`;
     try {
+      // sendDocument(buffer, optionsForFile)
       await bot.sendDocument(chatId, Buffer.from(csv), {}, { filename: fileName });
     } catch (err) {
       console.error('Error sending CSV buffer', err);
@@ -665,7 +610,6 @@ async function gracefulShutdown(signal) {
     // make one last attempt to flush queue (best effort)
     if (messageQueue.length) {
       console.log('Flushing message queue before exit...');
-      // Attempt sending remaining messages (not guaranteed)
       for (let i = 0; i < Math.min(20, messageQueue.length); i++) {
         await processQueueTick();
       }
@@ -682,16 +626,16 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Add this function BEFORE the main function
+// Test DB connection
 async function testConnection() {
   try {
     const client = await pool.connect();
-    console.log('✅ Successfully connected to Supabase database!');
-    console.log('📍 Host: db.sjxcfetwrzejxohskeft.supabase.co');
+    console.log('✅ Successfully connected to database!');
+    console.log('📍 Host:', dbUrl.hostname);
     client.release();
     return true;
   } catch (err) {
-    console.error('❌ Database connection failed:', err.message);
+    console.error('❌ Database connection failed:', err && err.message ? err.message : err);
     return false;
   }
 }
@@ -708,9 +652,10 @@ async function testConnection() {
       console.error('Cannot start without database connection');
       process.exit(1);
     }
-    
+
     await initTables();
-    // small delay to ensure DB is ready; then reschedule
+
+    // small delay to ensure DB is ready; then reschedule users' jobs
     setTimeout(rescheduleAll, 2000);
     console.log('Bot started and polling for Telegram updates.');
   } catch (err) {
