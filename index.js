@@ -56,12 +56,50 @@ const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000)
 const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000); // 30 seconds  
 const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 3); // Conservative for Supabas
 
+const { Pool } = require('pg');
+const dns = require('dns');
+const { promisify } = require('util');
+
+// Custom function to resolve hostname to IPv4
+async function resolveIPv4(hostname) {
+  try {
+    const resolve4 = promisify(dns.resolve4);
+    const addresses = await resolve4(hostname);
+    return addresses[0]; // Return the first IPv4 address
+  } catch (err) {
+    console.error('DNS resolution failed:', err.message);
+    return hostname; // Fall back to hostname
+  }
+}
+
+// Parse the database URL to extract components
+const { URL } = require('url');
+const dbUrl = new URL(process.env.DATABASE_URL);
+
+// Create pool configuration with custom connection logic
 const poolConfig = {
-  connectionString: DATABASE_URL,
+  user: dbUrl.username,
+  password: dbUrl.password,
+  host: dbUrl.hostname, // Will be resolved to IPv4
+  port: dbUrl.port || 5432,
+  database: dbUrl.pathname.replace('/', ''),
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
   idleTimeoutMillis: DB_IDLE_TIMEOUT,
   max: DB_MAX_CONNECTIONS,
-  host: 'db.sjxcfetwrzejxohskeft.supabase.co', // ← FORCE IPv4
+};
+
+// Override the connection logic to force IPv4
+const originalConnect = Pool.prototype.connect;
+Pool.prototype.connect = function(callback) {
+  // Resolve host to IPv4 before connecting
+  resolveIPv4(this.options.host).then(ipv4Address => {
+    this.options.host = ipv4Address;
+    console.log('Connecting to database at:', ipv4Address);
+    originalConnect.call(this, callback);
+  }).catch(err => {
+    console.error('Failed to resolve IPv4 address:', err);
+    callback(err);
+  });
 };
 
 if (process.env.DB_SSL === 'true') {
