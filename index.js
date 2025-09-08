@@ -56,7 +56,7 @@ const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000)
 const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000); // 30 seconds  
 const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 3); // Conservative for Supabas
 
-const { Pool } = require('pg');
+
 const dns = require('dns');
 const { promisify } = require('util');
 
