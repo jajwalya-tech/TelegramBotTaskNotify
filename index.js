@@ -56,20 +56,58 @@ const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 5000);
 const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 10000);
 const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 10);
 
+// Parse the database URL to extract components
+const { URL } = require('url');
+const dbUrl = new URL(process.env.DATABASE_URL);
+
 const poolConfig = {
-  connectionString: DATABASE_URL,
+  user: dbUrl.username,
+  password: dbUrl.password,
+  host: dbUrl.hostname, // This will be 'db.zycqtvzahzqutfrvykuv.supabase.co'
+  port: dbUrl.port || 5432,
+  database: dbUrl.pathname.replace('/', ''),
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
   idleTimeoutMillis: DB_IDLE_TIMEOUT,
   max: DB_MAX_CONNECTIONS,
-  host: 'db.sjxcfetwrzejxohskeft.supabase.co' // ← Force specific host
-  
 };
 
-if (process.env.DB_SSL === 'true') {
-  poolConfig.ssl = { rejectUnauthorized: false };
+// Force IPv4 by using the host's IPv4 address
+// We'll resolve the hostname to an IP address
+const dns = require('dns');
+const { promisify } = require('util');
+const resolve4 = promisify(dns.resolve4);
+
+async function getIPv4Address(hostname) {
+  try {
+    const addresses = await resolve4(hostname);
+    return addresses[0]; // Return the first IPv4 address
+  } catch (err) {
+    console.error('DNS resolution failed, using hostname directly:', err.message);
+    return hostname;
+  }
 }
 
-const pool = new Pool(poolConfig);
+// Modify the pool configuration to use IPv4
+(async function() {
+  try {
+    const ipv4Address = await getIPv4Address(poolConfig.host);
+    poolConfig.host = ipv4Address;
+    console.log('Resolved database host to IPv4:', ipv4Address);
+  } catch (err) {
+    console.error('Failed to resolve IPv4 address, using hostname:', err.message);
+  }
+  
+  // SSL configuration
+  if (process.env.DB_SSL === 'true') {
+    poolConfig.ssl = { rejectUnauthorized: false };
+  }
+
+  // Create the pool with the modified config
+  const pool = new Pool(poolConfig);
+  
+  // Rest of your code remains the same...
+  // Make sure to update all references to use this pool
+})();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
