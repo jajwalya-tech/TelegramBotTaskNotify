@@ -1,19 +1,21 @@
 {
-  "name": "telegram-task-bot",
-  "version": "1.0.0",
+  "name": "node-starter",
+  "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.61.0",
-    "pg": "^8.10.0",
-    "cron": "^3.0.0",
-    "dayjs": "^1.11.0",
-    "csv-stringify": "^6.0.0",
-    "dotenv": "^16.0.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.11.3",
+    "cron": "^3.1.6",
+    "dayjs": "^1.11.10",
+    "csv-stringify": "^6.4.4",
+    "dotenv": "^16.3.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.0.0"
   }
 }
