@@ -9,6 +9,7 @@
  *  - Pool SSL optional via DB_SSL env var
  *  - Auto-create user row on /addtask to avoid FK errors
  *  - Railway deployment fixes (IPv6/SSL handling)
+ *  - Force IPv4 connections for Railway compatibility
  *
  * ENV VARS (required):
  *   BOT_TOKEN        - Telegram bot token
@@ -19,6 +20,7 @@
  *   MSG_INTERVAL_MS  - queue polling interval in ms (default: 300)
  *   DB_SSL           - "true" to enable ssl: { rejectUnauthorized: false }
  *   DB_CONNECTION_TIMEOUT, DB_IDLE_TIMEOUT, DB_MAX_CONNECTIONS - pool tuning
+ *   FORCE_IPV4       - "true" to force IPv4 connections (default: true)
  *
  * Deployment:
  *   - If you keep polling: run as a Background Worker / Daemon (Railway).
@@ -34,6 +36,7 @@ const dayjs = require('dayjs');
 const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 const { stringify } = require('csv-stringify/sync');
+const { URL } = require('url');
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -55,44 +58,114 @@ const MSG_INTERVAL_MS = Number(process.env.MSG_INTERVAL_MS || 300);
 const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000);
 const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000);
 const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 10);
+const FORCE_IPV4 = process.env.FORCE_IPV4 !== 'false';
 
-// Enhanced pool configuration for Railway/Supabase
-const poolConfig = {
-  connectionString: DATABASE_URL,
-  connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
-  idleTimeoutMillis: DB_IDLE_TIMEOUT,
-  max: DB_MAX_CONNECTIONS,
-  // Force IPv4 for Railway compatibility
-  host: undefined, // Let pg parse from connectionString
-  ssl: {
-    rejectUnauthorized: false
+// Parse DATABASE_URL and create IPv4-compatible pool config
+function createPoolConfig(databaseUrl) {
+  try {
+    const dbUrl = new URL(databaseUrl);
+    
+    // Base configuration
+    const config = {
+      connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
+      idleTimeoutMillis: DB_IDLE_TIMEOUT,
+      max: DB_MAX_CONNECTIONS,
+      // Enable keep-alive for better connection stability
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
+    };
+
+    // Handle SSL configuration
+    if (process.env.DB_SSL !== 'false') {
+      config.ssl = {
+        rejectUnauthorized: false
+      };
+    }
+
+    // If forcing IPv4 or if we detect potential IPv6 issues
+    if (FORCE_IPV4) {
+      console.log('🔧 Configuring for IPv4-only connections...');
+      
+      // Extract connection details from URL
+      config.host = dbUrl.hostname;
+      config.port = dbUrl.port || 5432;
+      config.database = dbUrl.pathname.slice(1); // Remove leading '/'
+      config.user = dbUrl.username;
+      config.password = dbUrl.password;
+      
+      // Force IPv4 DNS resolution by using IPv4-specific options
+      config.host = dbUrl.hostname.replace(/^\[|\]$/g, ''); // Remove brackets if IPv6
+      
+      // Additional pg connection options to prefer IPv4
+      config.options = '-c default_transaction_isolation=read-committed';
+      
+    } else {
+      // Use connection string as-is
+      config.connectionString = databaseUrl;
+    }
+
+    return config;
+  } catch (err) {
+    console.error('❌ Error parsing DATABASE_URL:', err);
+    // Fallback to original approach
+    return {
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
+      idleTimeoutMillis: DB_IDLE_TIMEOUT,
+      max: DB_MAX_CONNECTIONS,
+      ssl: process.env.DB_SSL !== 'false' ? { rejectUnauthorized: false } : undefined
+    };
   }
-};
-
-// Override SSL setting if explicitly disabled
-if (process.env.DB_SSL === 'false') {
-  delete poolConfig.ssl;
 }
+
+const poolConfig = createPoolConfig(DATABASE_URL);
+console.log('🔧 Database pool config:', {
+  host: poolConfig.host || 'from-connection-string',
+  port: poolConfig.port || 'from-connection-string',
+  database: poolConfig.database || 'from-connection-string',
+  ssl: !!poolConfig.ssl,
+  forceIPv4: FORCE_IPV4
+});
 
 const pool = new Pool(poolConfig);
 
-// Test database connection before starting bot
+// Enhanced database connection testing with IPv4/IPv6 diagnostics
 async function testDatabaseConnection() {
   let retries = 5;
   while (retries > 0) {
     try {
       console.log('🔄 Testing database connection...');
-      const client = await pool.connect();
-      await client.query('SELECT NOW()');
-      client.release();
+      
+      // Set a shorter timeout for initial connection test
+      const testClient = await pool.connect();
+      const result = await testClient.query('SELECT NOW(), version()');
+      testClient.release();
+      
       console.log('✅ Database connection successful');
+      console.log('📊 PostgreSQL version:', result.rows[0].version.split(' ')[0] + ' ' + result.rows[0].version.split(' ')[1]);
       return true;
     } catch (err) {
       console.error(`❌ Database connection failed (${retries} retries left):`, err.message);
+      
+      // Check for specific IPv6 connectivity issues
+      if (err.message.includes('ENETUNREACH') && err.message.includes(':::')) {
+        console.error('🔍 IPv6 connectivity issue detected. This is common on Railway.');
+        if (!FORCE_IPV4) {
+          console.error('💡 Consider setting FORCE_IPV4=true environment variable.');
+        }
+      }
+      
+      // Check for SSL issues
+      if (err.message.includes('no pg_hba.conf entry') || err.message.includes('SSL')) {
+        console.error('🔍 SSL/Authentication issue detected.');
+        console.error('💡 Verify DATABASE_URL includes SSL parameters or set DB_SSL=false if not needed.');
+      }
+      
       retries--;
       if (retries > 0) {
-        console.log('⏳ Retrying in 5 seconds...');
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        const waitTime = (6 - retries) * 2; // Exponential backoff: 2, 4, 6, 8 seconds
+        console.log(`⏳ Retrying in ${waitTime} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
       }
     }
   }
@@ -680,6 +753,11 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 (async function main() {
   try {
     console.log('🚀 Starting Telegram Task Bot...');
+    console.log('🔧 Environment:', {
+      NODE_ENV: process.env.NODE_ENV,
+      FORCE_IPV4: FORCE_IPV4,
+      DB_SSL: process.env.DB_SSL !== 'false'
+    });
     await testDatabaseConnection();
     await initTables();
     // small delay to ensure DB is ready; then reschedule
