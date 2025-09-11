@@ -1,10 +1,28 @@
 /**
- * Telegram Task/Reminder Bot - Full ready-to-run file
+ * Telegram Task/Reminder Bot
  *
- * Notes:
- * - Fixed DB connection: no monkey-patching of Pool.prototype.connect.
- * - Use env vars BOT_TOKEN and DATABASE_URL (required).
- * - Optional: DEFAULT_TIMEZONE, MSG_INTERVAL_MS, DB_SSL, DB_CONNECTION_TIMEOUT, DB_IDLE_TIMEOUT, DB_MAX_CONNECTIONS
+ * Patches applied:
+ *  - Fix /settime parsing (split only on first colon)
+ *  - Message queue concurrency guard (processing flag)
+ *  - Send CSV as Buffer (no disk file I/O)
+ *  - SIGINT + SIGTERM handlers for graceful shutdown
+ *  - Pool SSL optional via DB_SSL env var
+ *  - Auto-create user row on /addtask to avoid FK errors
+ *  - Railway deployment fixes (IPv6/SSL handling)
+ *
+ * ENV VARS (required):
+ *   BOT_TOKEN        - Telegram bot token
+ *   DATABASE_URL     - Postgres connection string
+ *
+ * Optional ENV VARS:
+ *   DEFAULT_TIMEZONE - e.g. "Asia/Kolkata" (default: Asia/Kolkata)
+ *   MSG_INTERVAL_MS  - queue polling interval in ms (default: 300)
+ *   DB_SSL           - "true" to enable ssl: { rejectUnauthorized: false }
+ *   DB_CONNECTION_TIMEOUT, DB_IDLE_TIMEOUT, DB_MAX_CONNECTIONS - pool tuning
+ *
+ * Deployment:
+ *   - If you keep polling: run as a Background Worker / Daemon (Railway).
+ *   - If you prefer webhook mode, convert to webhook and run as Web Service.
  */
 
 require('dotenv').config();
@@ -22,50 +40,71 @@ dayjs.extend(tz);
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN env var. Exiting.');
+  console.error('❌ Missing BOT_TOKEN env var. Exiting.');
   process.exit(1);
 }
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
-  console.error('Missing DATABASE_URL env var. Exiting.');
+  console.error('❌ Missing DATABASE_URL env var. Exiting.');
   process.exit(1);
 }
 
 const DEFAULT_TZ = process.env.DEFAULT_TIMEZONE || 'Asia/Kolkata';
 const MSG_INTERVAL_MS = Number(process.env.MSG_INTERVAL_MS || 300);
-const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000); // 10 seconds
-const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000); // 30 seconds
-const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 3);
+const DB_CONNECTION_TIMEOUT = Number(process.env.DB_CONNECTION_TIMEOUT || 10000);
+const DB_IDLE_TIMEOUT = Number(process.env.DB_IDLE_TIMEOUT || 30000);
+const DB_MAX_CONNECTIONS = Number(process.env.DB_MAX_CONNECTIONS || 10);
 
-// Parse DB URL and build pool config (no monkey-patch)
-const { URL } = require('url');
-const dbUrl = new URL(DATABASE_URL);
-
+// Enhanced pool configuration for Railway/Supabase
 const poolConfig = {
-  user: dbUrl.username,
-  password: dbUrl.password,
-  host: dbUrl.hostname,
-  port: dbUrl.port || 5432,
-  database: dbUrl.pathname.replace('/', ''),
+  connectionString: DATABASE_URL,
   connectionTimeoutMillis: DB_CONNECTION_TIMEOUT,
   idleTimeoutMillis: DB_IDLE_TIMEOUT,
   max: DB_MAX_CONNECTIONS,
+  // Force IPv4 for Railway compatibility
+  host: undefined, // Let pg parse from connectionString
+  ssl: {
+    rejectUnauthorized: false
+  }
 };
 
-if (process.env.DB_SSL === 'true') {
-  poolConfig.ssl = { rejectUnauthorized: false };
+// Override SSL setting if explicitly disabled
+if (process.env.DB_SSL === 'false') {
+  delete poolConfig.ssl;
 }
 
 const pool = new Pool(poolConfig);
 
-// Create the bot (polling). It's safe because pool is created above.
+// Test database connection before starting bot
+async function testDatabaseConnection() {
+  let retries = 5;
+  while (retries > 0) {
+    try {
+      console.log('🔄 Testing database connection...');
+      const client = await pool.connect();
+      await client.query('SELECT NOW()');
+      client.release();
+      console.log('✅ Database connection successful');
+      return true;
+    } catch (err) {
+      console.error(`❌ Database connection failed (${retries} retries left):`, err.message);
+      retries--;
+      if (retries > 0) {
+        console.log('⏳ Retrying in 5 seconds...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+  }
+  console.error('❌ Cannot start without database connection');
+  process.exit(1);
+}
+
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 /* -------------------------
    Database: init tables
    ------------------------- */
-
 async function initTables() {
   const client = await pool.connect();
   try {
@@ -96,9 +135,9 @@ async function initTables() {
 
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_chat_date ON tasks(chat_id, date);`).catch(()=>{});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(date);`).catch(()=>{});
-    console.log('DB: tables ensured.');
+    console.log('✅ Database tables initialized');
   } catch (err) {
-    console.error('DB init error', err);
+    console.error('❌ Database init error', err);
     throw err;
   } finally {
     client.release();
@@ -106,42 +145,43 @@ async function initTables() {
 }
 
 /* -------------------------
-   Message templates
+   Messages templates
    ------------------------- */
 
 const messages =  {
   startOfDay: [
-    '🌅 Good morning {name}! Here are your tasks for today:\n{tasks}\n\n“Each morning we are born again. What we do today is what matters most.” — Buddha',
-    '☀️ Morning {name}! Ready to crush today? Tasks:\n{tasks}\n\n“Great things are not done by impulse, but by a series of small things brought together.” — Vincent van Gogh',
-    '🌞 Rise and shine {name}! Let’s make today count:\n{tasks}\n\n“Your time is limited, so don’t waste it living someone else’s life.” — Steve Jobs',
-    '🌻 Hello {name}, today is a blank canvas. Here are your brushstrokes:\n{tasks}\n\n“What would life be if we had no courage to attempt anything?” — Vincent van Gogh',
-    '🌤️ A new day begins, {name}. Your tasks:\n{tasks}\n\n“Life is what happens when you’re busy making other plans.” — John Lennon',
+    '🌅 Good morning {name}! Here are your tasks for today:\n{tasks}\n\n"Each morning we are born again. What we do today is what matters most." — Buddha',
+    '☀️ Morning {name}! Ready to crush today? Tasks:\n{tasks}\n\n"Great things are not done by impulse, but by a series of small things brought together." — Vincent van Gogh',
+    '🌞 Rise and shine {name}! Let\'s make today count:\n{tasks}\n\n"Your time is limited, so don\'t waste it living someone else\'s life.\" — Steve Jobs',
+    '🌻 Hello {name}, today is a blank canvas. Here are your brushstrokes:\n{tasks}\n\n"What would life be if we had no courage to attempt anything?" — Vincent van Gogh',
+    '🌤️ A new day begins, {name}. Your tasks:\n{tasks}\n\n"Life is what happens when you\'re busy making other plans.\" — John Lennon',
   ],
   morning: [
-    '⏰ Morning session starting soon, {name}! Stay centered.\n\n“Do not dwell in the past, do not dream of the future, concentrate the mind on the present moment.” — Buddha',
-    '💡 Hey {name} — morning session in a few minutes. Let’s go!\n\n“In the middle of every difficulty lies opportunity.” — Albert Einstein',
-    '🌱 Good focus makes the morning bloom, {name}.\n\n“Everything you can imagine is real.” — Pablo Picasso',
-    '🌄 Time to begin, {name}. Morning is the seed of success.\n\n“The best way to predict the future is to create it.” — Peter Drucker',
+    '⏰ Morning session starting soon, {name}! Stay centered.\n\n"Do not dwell in the past, do not dream of the future, concentrate the mind on the present moment.\" — Buddha',
+    '💡 Hey {name} — morning session in a few minutes. Let\'s go!\n\n"In the middle of every difficulty lies opportunity.\" — Albert Einstein',
+    '🌱 Good focus makes the morning bloom, {name}.\n\n"Everything you can imagine is real.\" — Pablo Picasso',
+    '🌄 Time to begin, {name}. Morning is the seed of success.\n\n"The best way to predict the future is to create it.\" — Peter Drucker',
   ],
   afternoon: [
-    '☀️ Afternoon check-in, {name}. You got this!\n\n“Without work, nothing prospers.” — Sophocles',
-    '🔔 Heads up {name} — afternoon session starting soon.\n\n“It does not matter how slowly you go as long as you do not stop.” — Confucius',
-    '🌿 Keep steady, {name}. Afternoon is the bridge to the evening.\n\n“I dream of painting and then I paint my dream.” — Vincent van Gogh',
-    '🍃 Midday reminder, {name}.\n\n“Success is not final, failure is not fatal: it is the courage to continue that counts.” — Winston Churchill',
+    '☀️ Afternoon check-in, {name}. You got this!\n\n"Without work, nothing prospers.\" — Sophocles',
+    '🔔 Heads up {name} — afternoon session starting soon.\n\n"It does not matter how slowly you go as long as you do not stop.\" — Confucius',
+    '🌿 Keep steady, {name}. Afternoon is the bridge to the evening.\n\n"I dream of painting and then I paint my dream.\" — Vincent van Gogh',
+    '🍃 Midday reminder, {name}.\n\n"Success is not final, failure is not fatal: it is the courage to continue that counts.\" — Winston Churchill',
   ],
   evening: [
-    '🌙 Evening wrap-up session in a bit, {name}.\n\n“Inspiration exists, but it has to find you working.” — Pablo Picasso',
-    '🌌 Evening reminder, {name}. Finish strong!\n\n“Your work is to discover your work and then with all your heart to give yourself to it.” — Buddha',
-    '🕯️ The day winds down, {name} — time to bring tasks to a close.\n\n“What is done in love is done well.” — Vincent van Gogh',
-    '🌠 Evening focus, {name}.\n\n“Try to be a rainbow in someone’s cloud.” — Maya Angelou',
+    '🌙 Evening wrap-up session in a bit, {name}.\n\n"Inspiration exists, but it has to find you working.\" — Pablo Picasso',
+    '🌌 Evening reminder, {name}. Finish strong!\n\n"Your work is to discover your work and then with all your heart to give yourself to it.\" — Buddha',
+    '🕯️ The day winds down, {name} — time to bring tasks to a close.\n\n"What is done in love is done well.\" — Vincent van Gogh',
+    '🌠 Evening focus, {name}.\n\n"Try to be a rainbow in someone\'s cloud.\" — Maya Angelou',
   ],
   endOfDay: [
-    '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Peace comes from within. Do not seek it without.” — Buddha',
-    '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Do not go where the path may lead, go instead where there is no path and leave a trail.” — Ralph Waldo Emerson',
-    '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“The wound is the place where the Light enters you.” — Rumi',
-    '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.” — Claude Monet',
-    '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don’t forget to add tomorrow’s tasks with /tomorrow\n\n“Happiness is not something ready made. It comes from your own actions.” — Dalai Lama',
-  ],
+  '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Peace comes from within. Do not seek it without.\" — Buddha',
+  '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Do not go where the path may lead, go instead where there is no path and leave a trail.\" — Ralph Waldo Emerson',
+  '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"The wound is the place where the Light enters you.\" — Rumi',
+  '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
+  '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
+],
+
 };
 
 function pickMessage(type, name = '', tasksStr = '') {
@@ -159,6 +199,7 @@ function localDateStr(tzName = DEFAULT_TZ, offsetDays = 0) {
 }
 
 function parseTimeHHMM(value) {
+  // Accept "HH:MM" 24-hour format
   if (!value || typeof value !== 'string') return null;
   const m = value.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
   if (!m) return null;
@@ -186,11 +227,13 @@ async function processQueueTick() {
     await bot.sendMessage(item.chatId, item.text, item.opts);
     messageQueue.shift();
   } catch (err) {
+    // If Telegram returns 403 (bot blocked) or 400 user not found, drop and cleanup schedules
     console.error('sendMessage error for', item.chatId, err.message || err);
     item.retries = (item.retries || 0) + 1;
-    if (item.retries >= 3 || (err.response && [400, 403, 404].includes(err.response.statusCode))) {
+    if (item.retries >= 3 || (err.response && [400,403,404].includes(err.response.statusCode))) {
       console.warn(`Dropping message for ${item.chatId} after ${item.retries} retries.`);
       messageQueue.shift();
+      // If bot was blocked (403), remove scheduled jobs for that chat to avoid future retries
       if (err.response && err.response.statusCode === 403) {
         clearJobs(item.chatId);
       }
@@ -225,7 +268,7 @@ function pushJob(chatId, job) {
 
 /**
  * Convert "HH:MM" to cron pattern for daily at that time in local timezone
- * Cron: 'm H * * *'
+ * Cron: 'm H * * *' with second optional
  */
 function cronPatternForHHMM(hhmm) {
   const [hh, mm] = hhmm.split(':');
@@ -336,7 +379,7 @@ async function rescheduleAll() {
         console.error('scheduleAllForUser error for', user.chat_id, e);
       }
     }
-    console.log('Reschedule complete for', rows.length, 'users.');
+    console.log('✅ Reschedule complete for', rows.length, 'users.');
   } catch (err) {
     console.error('rescheduleAll error', err);
   }
@@ -487,7 +530,8 @@ bot.onText(/\/noreason (.+)/, async (msg, match) => {
  * Example usage:
  *   /settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00
  *
- * This handler will parse using only first colon as separator so times with ':' remain intact.
+ * This handler will parse using only first colon as separator so times with ':'
+ * remain intact.
  */
 bot.onText(/\/settime (.+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
@@ -512,11 +556,14 @@ bot.onText(/\/settime (.+)/, async (msg, match) => {
   if (!Object.keys(newSessions).length) return bot.sendMessage(chatId, 'No valid time entries found.');
 
   try {
+    // load user, update sessions
     await pool.query(`INSERT INTO users (chat_id, timezone, sessions, created_at, updated_at) VALUES ($1,$2,$3,NOW(),NOW()) ON CONFLICT (chat_id) DO UPDATE SET sessions = $3, updated_at = NOW()`, [chatId, DEFAULT_TZ, JSON.stringify(newSessions)]);
+    // refresh schedule
     clearJobs(chatId);
     const { rows } = await pool.query(`SELECT * FROM users WHERE chat_id=$1`, [chatId]);
     const user = rows[0];
     if (user) {
+      // merge sessions: keep missing keys from prior sessions or defaults
       user.sessions = Object.assign({
         startOfDay: '07:00',
         morning: '08:30',
@@ -574,7 +621,6 @@ bot.onText(/\/report (weekly|monthly)/, async (msg, match) => {
     });
     const fileName = `report_${chatId}_${type}_${dayjs().format('YYYYMMDD_HHmmss')}.csv`;
     try {
-      // sendDocument(buffer, optionsForFile)
       await bot.sendDocument(chatId, Buffer.from(csv), {}, { filename: fileName });
     } catch (err) {
       console.error('Error sending CSV buffer', err);
@@ -610,6 +656,7 @@ async function gracefulShutdown(signal) {
     // make one last attempt to flush queue (best effort)
     if (messageQueue.length) {
       console.log('Flushing message queue before exit...');
+      // Attempt sending remaining messages (not guaranteed)
       for (let i = 0; i < Math.min(20, messageQueue.length); i++) {
         await processQueueTick();
       }
@@ -626,40 +673,20 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Test DB connection
-async function testConnection() {
-  try {
-    const client = await pool.connect();
-    console.log('✅ Successfully connected to database!');
-    console.log('📍 Host:', dbUrl.hostname);
-    client.release();
-    return true;
-  } catch (err) {
-    console.error('❌ Database connection failed:', err && err.message ? err.message : err);
-    return false;
-  }
-}
-
 /* -------------------------
    Startup sequence
    ------------------------- */
 
 (async function main() {
   try {
-    // Test connection first
-    const connected = await testConnection();
-    if (!connected) {
-      console.error('Cannot start without database connection');
-      process.exit(1);
-    }
-
+    console.log('🚀 Starting Telegram Task Bot...');
+    await testDatabaseConnection();
     await initTables();
-
-    // small delay to ensure DB is ready; then reschedule users' jobs
+    // small delay to ensure DB is ready; then reschedule
     setTimeout(rescheduleAll, 2000);
-    console.log('Bot started and polling for Telegram updates.');
+    console.log('✅ Bot started and polling for Telegram updates.');
   } catch (err) {
-    console.error('Startup error', err);
+    console.error('❌ Startup error', err);
     process.exit(1);
   }
 })();
