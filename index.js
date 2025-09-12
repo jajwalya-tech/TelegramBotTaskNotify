@@ -218,6 +218,16 @@ async function initTables() {
   } finally {
     client.release();
   }
+// After the CREATE TABLE statements in initTables(), add:
+try {
+  await client.query(`
+    ALTER TABLE users 
+    ADD COLUMN IF NOT EXISTS interval_set_date DATE DEFAULT NULL
+  `);
+  console.log('✅ Added interval_set_date column if needed');
+} catch (err) {
+  console.log('ℹ️ interval_set_date column already exists or could not be added:', err.message);
+}
 }
 
 /* -------------------------
@@ -300,13 +310,23 @@ function isMandatoryDayOff(user) {
   if (!user.mandatory_day_off_interval) return false;
   
   const today = dayjs().tz(user.timezone || DEFAULT_TZ);
-  const lastDayOff = user.last_mandatory_day_off ? 
-    dayjs(user.last_mandatory_day_off).tz(user.timezone || DEFAULT_TZ) : 
-    dayjs().tz(user.timezone || DEFAULT_TZ).subtract(user.mandatory_day_off_interval, 'day');
   
-  // Check if it's time for a new mandatory day off
-  const daysSinceLastOff = today.diff(lastDayOff, 'day');
-  return daysSinceLastOff >= user.mandatory_day_off_interval;
+  // If user has taken a day off before, use that date
+  if (user.last_mandatory_day_off) {
+    const lastDayOff = dayjs(user.last_mandatory_day_off).tz(user.timezone || DEFAULT_TZ);
+    const daysSinceLastOff = today.diff(lastDayOff, 'day');
+    return daysSinceLastOff >= user.mandatory_day_off_interval;
+  }
+  
+  // If no day off taken yet, calculate from when interval was set
+  if (user.interval_set_date) {
+    const intervalStart = dayjs(user.interval_set_date).tz(user.timezone || DEFAULT_TZ);
+    const daysSinceIntervalSet = today.diff(intervalStart, 'day');
+    return daysSinceIntervalSet >= user.mandatory_day_off_interval;
+  }
+  
+  // Fallback: if no interval_set_date, use today as start (shouldn't happen)
+  return false;
 }
 
 /* -------------------------
@@ -526,6 +546,8 @@ bot.onText(/\/start|\/help/, (msg) => {
     '/noreason <reason> - declare no tasks were added but give reason',
     '/settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00 - change times',
     '/setinterval <days> - set mandatory day off interval (e.g., 15)',
+    '/showtimes - display your current schedule timings',
+    '/showinterval - display your day off interval settings',
     '/report weekly|monthly - get CSV report',
     '/today - list today tasks',
     '/deleteuser - delete your account and all data',
@@ -678,9 +700,10 @@ bot.onText(/\/setinterval (\d+)/, async (msg, match) => {
   }
   
   try {
+    const today = localDateStr(DEFAULT_TZ, 0);
     await pool.query(
-      `UPDATE users SET mandatory_day_off_interval = $1, updated_at = NOW() WHERE chat_id = $2`,
-      [interval, chatId]
+      `UPDATE users SET mandatory_day_off_interval = $1, interval_set_date = $2, updated_at = NOW() WHERE chat_id = $3`,
+      [interval, today, chatId]
     );
     
     // Reschedule to apply changes
@@ -690,7 +713,7 @@ bot.onText(/\/setinterval (\d+)/, async (msg, match) => {
       await scheduleAllForUser(rows[0]);
     }
     
-    return bot.sendMessage(chatId, `Mandatory day off interval set to ${interval} days.`);
+    return bot.sendMessage(chatId, `Mandatory day off interval set to ${interval} days. First day off will be in ${interval} days.`);
   } catch (err) {
     console.error('/setinterval error', err);
     return bot.sendMessage(chatId, 'Failed to set interval. Try again later.');
@@ -752,6 +775,92 @@ bot.onText(/\/settime (.+)/, async (msg, match) => {
     console.error('/settime error', err);
     return bot.sendMessage(chatId, 'Failed to set times. Try again later.');
   }
+});
+
+// Add these command handlers after the existing command handlers
+
+bot.onText(/\/showtimes/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  
+  try {
+    const { rows } = await pool.query(`SELECT sessions, timezone FROM users WHERE chat_id = $1`, [chatId]);
+    
+    if (!rows.length) {
+      return bot.sendMessage(chatId, 'You need to register first using /register <name>');
+    }
+    
+    const user = rows[0];
+    const sessions = user.sessions || {
+      startOfDay: '07:00',
+      morning: '08:30',
+      afternoon: '14:30',
+      evening: '19:30',
+      endOfDay: '22:00'
+    };
+    
+    const timezone = user.timezone || DEFAULT_TZ;
+    
+    const message = `⏰ Your current schedule (Timezone: ${timezone}):\n\n` +
+      `🌅 Start of Day: ${sessions.startOfDay || 'Not set'}\n` +
+      `☀️ Morning Session: ${sessions.morning || 'Not set'}\n` +
+      `🌞 Afternoon Session: ${sessions.afternoon || 'Not set'}\n` +
+      `🌙 Evening Session: ${sessions.evening || 'Not set'}\n` +
+      `🌌 End of Day: ${sessions.endOfDay || 'Not set'}\n\n` +
+      `Use /settime to change these timings. Example:\n` +
+      `/settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00`;
+    
+    return bot.sendMessage(chatId, message);
+  } catch (err) {
+    console.error('/showtimes error', err);
+    return bot.sendMessage(chatId, 'Failed to fetch your schedule. Try again later.');
+  }
+});
+
+bot.onText(/\/showinterval/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  
+  try {
+    const { rows } = await pool.query(
+      `SELECT mandatory_day_off_interval, last_mandatory_day_off, timezone FROM users WHERE chat_id = $1`,
+      [chatId]
+    );
+    
+    if (!rows.length) {
+      return bot.sendMessage(chatId, 'You need to register first using /register <name>');
+    }
+    
+    const user = rows[0];
+    const interval = user.mandatory_day_off_interval;
+    const lastDayOff = user.last_mandatory_day_off;
+    const timezone = user.timezone || DEFAULT_TZ;
+    
+    let message = `📅 Your Mandatory Day Off Settings:\n\n`;
+    
+    // Inside /showinterval command, update the message generation:
+if (interval) {
+  message += `🔄 Interval: Every ${interval} days\n`;
+  
+  let nextOffDate;
+  if (lastDayOff) {
+    const lastOffDate = dayjs(lastDayOff).tz(timezone).format('YYYY-MM-DD');
+    nextOffDate = dayjs(lastDayOff).tz(timezone).add(interval, 'day').format('YYYY-MM-DD');
+    const daysUntilNext = interval - dayjs().tz(timezone).diff(dayjs(lastDayOff).tz(timezone), 'day');
+    
+    message += `📆 Last day off: ${lastOffDate}\n`;
+    message += `⏭️ Next day off: ${nextOffDate}\n`;
+    message += `📋 Days until next: ${Math.max(0, daysUntilNext)}\n`;
+  } else if (user.interval_set_date) {
+    const startDate = dayjs(user.interval_set_date).tz(timezone).format('YYYY-MM-DD');
+    nextOffDate = dayjs(user.interval_set_date).tz(timezone).add(interval, 'day').format('YYYY-MM-DD');
+    const daysUntilNext = interval - dayjs().tz(timezone).diff(dayjs(user.interval_set_date).tz(timezone), 'day');
+    
+    message += `📆 Interval started: ${startDate}\n`;
+    message += `⏭️ First day off: ${nextOffDate}\n`;
+    message += `📋 Days until first: ${Math.max(0, daysUntilNext)}\n`;
+  } else {
+    message += `📆 Status: Ready for first day off\n`;
+  }
+}
 });
 
 bot.onText(/\/today/, async (msg) => {
