@@ -38,7 +38,6 @@ const utc = require('dayjs/plugin/utc');
 const tz = require('dayjs/plugin/timezone');
 const { stringify } = require('csv-stringify/sync');
 const { URL } = require('url');
-const { parse } = require('csv-stringify/sync'); //ADDED CSV PARSING
 
 dayjs.extend(utc);
 dayjs.extend(tz);
@@ -1027,7 +1026,7 @@ bot.on("message", async (msg) => {
 // === REPORT GENERATION FUNCTION ===
 async function sendReport(chatId, startDate, endDate) {
   try {
-    let query = `SELECT task, completed, reason, created_at
+    let query = `SELECT description, completed, reason, created_at
                  FROM tasks 
                  WHERE chat_id = $1`;
     const params = [chatId];
@@ -1098,12 +1097,12 @@ bot.on("callback_query", async (query) => {
     for (const [day, tasks] of Object.entries(grouped)) {
       textReport += `📅 *${day}*\n`;
 
-      if (tasks.length === 1 && tasks[0].task === "Mandatory Day Off") {
+      if (tasks.length === 1 && tasks[0].description === "Mandatory Day Off") {
         textReport += `   🌴 Mandatory Day Off\n\n`;
         continue;
       }
 
-      if (tasks.length === 1 && tasks[0].task === "No Tasks Uploaded") {
+      if (tasks.length === 1 && tasks[0].description === "No Tasks Uploaded") {
         textReport += `   ❌ No tasks uploaded\n`;
         textReport += `      ⚠ Reason: ${tasks[0].reason || "Not provided"}\n\n`;
         continue;
@@ -1111,7 +1110,7 @@ bot.on("callback_query", async (query) => {
 
       tasks.forEach((row, idx) => {
         const status = row.completed ? "✅" : "❌";
-        textReport += `   ${idx + 1}. ${row.task} ${status}\n`;
+        textReport += `   ${idx + 1}. ${row.description} ${status}\n`;
         if (!row.completed) {
           textReport += `      ⚠ Reason: ${row.reason || "Not provided"}\n`;
         }
@@ -1122,7 +1121,7 @@ bot.on("callback_query", async (query) => {
 
     // CSV
     const csv = parse(rows, {
-      fields: ["task", "completed", "reason", "created_at"],
+      fields: ["description", "completed", "reason", "created_at"],
     });
 
     // Send depending on choice
