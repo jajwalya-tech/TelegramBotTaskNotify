@@ -1120,7 +1120,7 @@ bot.on("callback_query", async (query) => {
     }
 
     // CSV
-    const csv = parse(rows, {
+    const csv = stringify(rows, {
       fields: ["description", "completed", "reason", "created_at"],
     });
 
