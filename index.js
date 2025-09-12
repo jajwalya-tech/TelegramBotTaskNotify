@@ -176,6 +176,10 @@ async function testDatabaseConnection() {
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+/* ADD THIS TO users TABLE if its a new deployment
+    --mandatory_day_off_interval INTEGER DEFAULT NULL
+    --last_mandatory_day_off DATE DEFAULT NULL,         
+    --interval_set_date DATE DEFAULT NULL.*/
 /* -------------------------
    Database: init tables
    ------------------------- */
@@ -189,8 +193,6 @@ async function initTables() {
         timezone TEXT,
         sessions JSONB,
         fun_day JSONB,
-        mandatory_day_off_interval INTEGER DEFAULT NULL,
-        last_mandatory_day_off DATE DEFAULT NULL,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
@@ -211,16 +213,30 @@ async function initTables() {
 
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_chat_date ON tasks(chat_id, date);`).catch(()=>{});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(date);`).catch(()=>{});
-    // After the CREATE TABLE statements in initTables(), add:
+    // Migration for existing tables - add missing columns if they don't exist
     try {
-        await client.query(`
+      await client.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS mandatory_day_off_interval INTEGER DEFAULT NULL
+      `);
+      console.log('✅ Added mandatory_day_off_interval column if needed');
+      
+      await client.query(`
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS last_mandatory_day_off DATE DEFAULT NULL
+      `);
+      console.log('✅ Added last_mandatory_day_off column if needed');
+      
+      await client.query(`
         ALTER TABLE users 
         ADD COLUMN IF NOT EXISTS interval_set_date DATE DEFAULT NULL
-  `);
-    console.log('✅ Added interval_set_date column if needed');
-      } catch (err) {
-      console.log('ℹ️ interval_set_date column already exists or could not be added:', err.message);
+      `);
+      console.log('✅ Added interval_set_date column if needed');
+      
+    } catch (err) {
+      console.log('ℹ️ Columns already exist or could not be added:', err.message);
     }
+    
     console.log('✅ Database tables initialized');
   } catch (err) {
     console.error('❌ Database init error', err);
