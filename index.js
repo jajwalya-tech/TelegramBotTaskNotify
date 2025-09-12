@@ -1,4 +1,10 @@
-/**
+ANALYZE THE CODE BELOW AND TELL ME ABOUT EACH OF ITS BOT FUNNCTIONS:
+
+
+
+ANALYZE THE BELOW CODE AND TELL HOW IT IS:
+
+/** 
  * Telegram Task/Reminder Bot
  *
  * Patches applied:
@@ -188,6 +194,8 @@ async function initTables() {
         timezone TEXT,
         sessions JSONB,
         fun_day JSONB,
+        mandatory_day_off_interval INTEGER DEFAULT NULL,
+        last_mandatory_day_off DATE DEFAULT NULL,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
@@ -254,7 +262,18 @@ const messages =  {
   '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
   '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
 ],
-
+  mandatoryDayOff: [
+    '🌴 Today is your mandatory day off {name}! Time to relax and recharge.\n\n"Rest when you\'re weary. Refresh and renew yourself, your body, your mind, your spirit. Then get back to work." — Ralph Marston',
+    '🎉 Enjoy your well-deserved day off {name}! You\'ve earned it.\n\n"Almost everything will work again if you unplug it for a few minutes, including you." — Anne Lamott',
+    '🌞 Mandatory rest day {name}! Take time for yourself today.\n\n"Take rest; a field that has rested gives a bountiful crop." — Ovid',
+    '🏖️ It\'s your mandatory day off {name}! Enjoy the break.\n\n"Sometimes the most productive thing you can do is relax." — Mark Black',
+  ],
+  endMandatoryDay: [
+    '🌙 Your mandatory day off is ending {name}. Don\'t forget to add tomorrow\'s tasks with /tomorrow',
+    '🌠 Hope you enjoyed your day off {name}! Time to plan for tomorrow with /tomorrow',
+    '😊 Rest day complete {name}! Ready to get back to it tomorrow? Use /tomorrow to add tasks',
+    '💫 Your day of rest is over {name}. Prepare for tomorrow with /tomorrow',
+  ]
 };
 
 function pickMessage(type, name = '', tasksStr = '') {
@@ -279,6 +298,20 @@ function parseTimeHHMM(value) {
   const hh = m[1].padStart(2, '0');
   const mm = m[2].padStart(2, '0');
   return `${hh}:${mm}`;
+}
+
+// Helper function to check if today is a mandatory day off
+function isMandatoryDayOff(user) {
+  if (!user.mandatory_day_off_interval) return false;
+  
+  const today = dayjs().tz(user.timezone || DEFAULT_TZ);
+  const lastDayOff = user.last_mandatory_day_off ? 
+    dayjs(user.last_mandatory_day_off).tz(user.timezone || DEFAULT_TZ) : 
+    dayjs().tz(user.timezone || DEFAULT_TZ).subtract(user.mandatory_day_off_interval, 'day');
+  
+  // Check if it's time for a new mandatory day off
+  const daysSinceLastOff = today.diff(lastDayOff, 'day');
+  return daysSinceLastOff >= user.mandatory_day_off_interval;
 }
 
 /* -------------------------
@@ -369,12 +402,18 @@ async function scheduleAllForUser(user) {
     const pattern = cronPatternForHHMM(sessions.startOfDay);
     const job = new CronJob(pattern, async () => {
       try {
+        // Check if today is a mandatory day off
+        if (isMandatoryDayOff(user)) {
+          enqueueMessage(chatId, pickMessage('mandatoryDayOff', name));
+          return;
+        }
+        
         const today = localDateStr(tzName, 0);
         const { rows } = await pool.query(
           `SELECT id, description, completed FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`,
           [chatId, today]
         );
-        let tasksStr = rows.length ? rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : ''}`).join('\n') : 'No tasks for today.';
+        let tasksStr = rows.length ? rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}`).join('\n') : 'No tasks for today.';
         enqueueMessage(chatId, pickMessage('startOfDay', name, tasksStr));
       } catch (err) {
         console.error('startOfDay job error', err);
@@ -397,6 +436,8 @@ async function scheduleAllForUser(user) {
     const cron15 = `${dt15.minute()} ${dt15.hour()} * * *`;
     const job15 = new CronJob(cron15, async () => {
       try {
+        // Skip on mandatory day off
+        if (isMandatoryDayOff(user)) return;
         enqueueMessage(chatId, `${pickMessage(key, name)}\nStarts in 15 minutes.`);
       } catch (err) {
         console.error('session 15 job error', err);
@@ -409,6 +450,8 @@ async function scheduleAllForUser(user) {
     const cron5 = `${dt5.minute()} ${dt5.hour()} * * *`;
     const job5 = new CronJob(cron5, async () => {
       try {
+        // Skip on mandatory day off
+        if (isMandatoryDayOff(user)) return;
         enqueueMessage(chatId, `${pickMessage(key, name)}\nStarts in 5 minutes.`);
       } catch (err) {
         console.error('session 5 job error', err);
@@ -423,6 +466,19 @@ async function scheduleAllForUser(user) {
     const job = new CronJob(pattern, async () => {
       try {
         const today = localDateStr(tzName, 0);
+        
+        // Check if today is a mandatory day off
+        if (isMandatoryDayOff(user)) {
+          // Update last mandatory day off date
+          await pool.query(
+            `UPDATE users SET last_mandatory_day_off = $1, updated_at = NOW() WHERE chat_id = $2`,
+            [today, chatId]
+          );
+          
+          enqueueMessage(chatId, pickMessage('endMandatoryDay', name));
+          return;
+        }
+        
         const { rows } = await pool.query(
           `SELECT id, description, completed FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`,
           [chatId, today]
@@ -430,7 +486,7 @@ async function scheduleAllForUser(user) {
         const incomplete = rows.filter(r => !r.completed);
         let tasksStr;
         if (rows.length === 0) tasksStr = 'No tasks were added today.';
-        else tasksStr = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : ''}`).join('\n');
+        else tasksStr = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}`).join('\n');
 
         enqueueMessage(chatId, pickMessage('endOfDay', name, tasksStr));
       } catch (err) {
@@ -470,11 +526,14 @@ bot.onText(/\/start|\/help/, (msg) => {
     '/addtask <task> - add task for today',
     '/tomorrow <t1; t2; ...> - add tasks for tomorrow',
     '/markcomplete <task_id> - mark a task complete',
+    '/markincomplete <task_id> - mark a task incomplete',
     '/reason <task_id> <reason> - add reason for incomplete task',
     '/noreason <reason> - declare no tasks were added but give reason',
     '/settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00 - change times',
+    '/setinterval <days> - set mandatory day off interval (e.g., 15)',
     '/report weekly|monthly - get CSV report',
     '/today - list today tasks',
+    '/deleteuser - delete your account and all data',
   ].join('\n');
   bot.sendMessage(chatId, helpText);
 });
@@ -568,6 +627,22 @@ bot.onText(/\/markcomplete (\d+)/, async (msg, match) => {
   }
 });
 
+// Add markincomplete command
+bot.onText(/\/markincomplete (\d+)/, async (msg, match) => {
+  const chatId = String(msg.chat.id);
+  const id = Number(match[1]);
+  if (!id) return bot.sendMessage(chatId, 'Provide a valid task id: /markincomplete 123');
+
+  try {
+    const res = await pool.query(`UPDATE tasks SET completed = FALSE, updated_at = NOW() WHERE id=$1 AND chat_id=$2 RETURNING description`, [id, chatId]);
+    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task ${id} found.`);
+    return bot.sendMessage(chatId, `Marked task ${id} incomplete: ${res.rows[0].description}`);
+  } catch (err) {
+    console.error('/markincomplete error', err);
+    return bot.sendMessage(chatId, 'Failed to mark incomplete. Try again later.');
+  }
+});
+
 bot.onText(/\/reason (\d+)\s+(.+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
   const id = Number(match[1]);
@@ -595,6 +670,35 @@ bot.onText(/\/noreason (.+)/, async (msg, match) => {
   } catch (err) {
     console.error('/noreason error', err);
     return bot.sendMessage(chatId, 'Failed to record. Try again later.');
+  }
+});
+
+// Add setinterval command
+bot.onText(/\/setinterval (\d+)/, async (msg, match) => {
+  const chatId = String(msg.chat.id);
+  const interval = parseInt(match[1]);
+  
+  if (!interval || interval < 1) {
+    return bot.sendMessage(chatId, 'Please provide a valid interval (e.g., /setinterval 15)');
+  }
+  
+  try {
+    await pool.query(
+      `UPDATE users SET mandatory_day_off_interval = $1, updated_at = NOW() WHERE chat_id = $2`,
+      [interval, chatId]
+    );
+    
+    // Reschedule to apply changes
+    const { rows } = await pool.query(`SELECT * FROM users WHERE chat_id=$1`, [chatId]);
+    if (rows.length) {
+      clearJobs(chatId);
+      await scheduleAllForUser(rows[0]);
+    }
+    
+    return bot.sendMessage(chatId, `Mandatory day off interval set to ${interval} days.`);
+  } catch (err) {
+    console.error('/setinterval error', err);
+    return bot.sendMessage(chatId, 'Failed to set interval. Try again later.');
   }
 });
 
@@ -661,7 +765,7 @@ bot.onText(/\/today/, async (msg) => {
   try {
     const { rows } = await pool.query(`SELECT id, description, completed, reason FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`, [chatId, date]);
     if (!rows.length) return bot.sendMessage(chatId, `No tasks for today (${date}).`);
-    const text = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : ''}${r.reason ? ' — ' + r.reason : ''}`).join('\n');
+    const text = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}${r.reason ? ' — ' + r.reason : ''}`).join('\n');
     return bot.sendMessage(chatId, `Tasks for ${date}:\n${text}`);
   } catch (err) {
     console.error('/today error', err);
@@ -669,41 +773,264 @@ bot.onText(/\/today/, async (msg) => {
   }
 });
 
-/* Report generation: weekly or monthly */
-bot.onText(/\/report (weekly|monthly)/, async (msg, match) => {
+// Add deleteuser command with confirmation
+bot.onText(/\/deleteuser/, async (msg) => {
   const chatId = String(msg.chat.id);
-  const type = match[1];
-  let startDate;
-  const tzName = DEFAULT_TZ;
-  if (type === 'weekly') {
-    startDate = dayjs().tz(tzName).subtract(7, 'day').format('YYYY-MM-DD');
-  } else {
-    startDate = dayjs().tz(tzName).subtract(1, 'month').format('YYYY-MM-DD');
-  }
-  try {
-    const { rows } = await pool.query(`SELECT date, description, completed, reason FROM tasks WHERE chat_id=$1 AND date >= $2 ORDER BY date`, [chatId, startDate]);
-    if (!rows.length) return bot.sendMessage(chatId, `No tasks since ${startDate}.`);
-    const csv = stringify(rows, {
-      header: true,
-      columns: [
-        { key: 'date', header: 'Date' },
-        { key: 'description', header: 'Task' },
-        { key: 'completed', header: 'Completed' },
-        { key: 'reason', header: 'Reason' }
+  
+  // Send confirmation message with inline keyboard
+  const opts = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '✅ Yes, delete my account', callback_data: 'deleteuser_confirm' },
+          { text: '❌ Cancel', callback_data: 'deleteuser_cancel' }
+        ]
       ]
-    });
-    const fileName = `report_${chatId}_${type}_${dayjs().format('YYYYMMDD_HHmmss')}.csv`;
-    try {
-      await bot.sendDocument(chatId, Buffer.from(csv), {}, { filename: fileName });
-    } catch (err) {
-      console.error('Error sending CSV buffer', err);
-      await bot.sendMessage(chatId, 'Failed to send report. Try again later.');
     }
-  } catch (err) {
-    console.error('/report error', err);
-    return bot.sendMessage(chatId, 'Failed to build report. Try again later.');
+  };
+  
+  return bot.sendMessage(chatId, '⚠️ Are you sure you want to delete your account and all your data? This action cannot be undone.', opts);
+});
+
+// Handle confirmation callback
+bot.on('callback_query', async (callbackQuery) => {
+  const chatId = String(callbackQuery.message.chat.id);
+  const data = callbackQuery.data;
+
+  if (data === 'deleteuser_confirm') {
+    try {
+      // First delete all tasks for this user
+      await pool.query('DELETE FROM tasks WHERE chat_id = $1', [chatId]);
+      
+      // Then delete the user
+      await pool.query('DELETE FROM users WHERE chat_id = $1', [chatId]);
+      
+      // Clear scheduled jobs
+      clearJobs(chatId);
+      
+      // Answer callback and send confirmation
+      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Account deleted successfully' });
+      return bot.sendMessage(chatId, '✅ Your account and all associated data have been deleted.');
+    } catch (err) {
+      console.error('/deleteuser error', err);
+      await bot.answerCallbackQuery(callbackQuery.id, { text: 'Error deleting account' });
+      return bot.sendMessage(chatId, 'Failed to delete account. Try again later.');
+    }
+  } else if (data === 'deleteuser_cancel') {
+    await bot.answerCallbackQuery(callbackQuery.id, { text: 'Account deletion cancelled' });
+    return bot.sendMessage(chatId, 'Account deletion cancelled. Your data is safe.');
+  }
+  
+  // Answer any other callback queries to prevent hanging
+  await bot.answerCallbackQuery(callbackQuery.id);
+}); 
+// === /report COMMAND ===
+const lastReports = {}; // cache per user
+const reportAwaitingRange = {}; // track who is entering custom range
+
+bot.onText(/\/report/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  await bot.sendMessage(chatId, "📊 Select the report range:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📅 Last 7 Days", callback_data: "range_7" }],
+        [{ text: "📅 Last 30 Days", callback_data: "range_30" }],
+        [{ text: "📅 Full Report", callback_data: "range_full" }],
+        [{ text: "📝 Custom Range", callback_data: "range_custom" }],
+      ],
+    },
+  });
+});
+
+// === HANDLE RANGE SELECTION ===
+bot.on("callback_query", async (query) => {
+  const chatId = query.message.chat.id;
+
+  // Step 1: custom range request
+  if (query.data === "range_custom") {
+    reportAwaitingRange[chatId] = true;
+    bot.answerCallbackQuery(query.id);
+    return bot.sendMessage(
+      chatId,
+      "📌 Please enter date range in format:\n`DD-MM-YYYY to DD-MM-YYYY`",
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // Step 2: handle predefined ranges
+  let startDate, endDate;
+  if (query.data === "range_7") {
+    endDate = new Date();
+    startDate = new Date();
+    startDate.setDate(endDate.getDate() - 6); // last 7 days
+  } else if (query.data === "range_30") {
+    endDate = new Date();
+    startDate = new Date();
+    startDate.setDate(endDate.getDate() - 29); // last 30 days
+  } else if (query.data === "range_full") {
+    endDate = null; // fetch all
+    startDate = null;
+  } else {
+    return; // not our concern
+  }
+
+  bot.answerCallbackQuery(query.id);
+  await sendReport(chatId, startDate, endDate);
+});
+
+// === HANDLE CUSTOM RANGE TEXT ===
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+
+  if (reportAwaitingRange[chatId]) {
+    const input = msg.text.trim();
+    const match = input.match(
+      /^(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})$/
+    );
+
+    if (!match) {
+      return bot.sendMessage(
+        chatId,
+        "⚠ Invalid format. Please use: `DD-MM-YYYY to DD-MM-YYYY`",
+        { parse_mode: "Markdown" }
+      );
+    }
+
+    const startDate = new Date(match[1].split("-").reverse().join("-"));
+    const endDate = new Date(match[2].split("-").reverse().join("-"));
+    endDate.setHours(23, 59, 59, 999); // include whole day
+
+    delete reportAwaitingRange[chatId];
+    return sendReport(chatId, startDate, endDate);
   }
 });
+
+// === REPORT GENERATION FUNCTION ===
+async function sendReport(chatId, startDate, endDate) {
+  try {
+    let query = `SELECT task, completed, reason, created_at
+                 FROM tasks 
+                 WHERE chat_id = $1`;
+    const params = [chatId];
+
+    if (startDate && endDate) {
+      query += ` AND created_at BETWEEN $2 AND $3 ORDER BY created_at ASC`;
+      params.push(startDate, endDate);
+    } else {
+      query += ` ORDER BY created_at ASC`;
+    }
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return bot.sendMessage(chatId, "No tasks found for this period.");
+    }
+
+    // cache
+    lastReports[chatId] = result.rows;
+
+    // ask output format
+    await bot.sendMessage(chatId, "📊 How would you like the report?", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📝 Text Only", callback_data: "report_text" }],
+          [{ text: "📂 CSV Only", callback_data: "report_csv" }],
+          [{ text: "📝 + 📂 Both", callback_data: "report_both" }],
+        ],
+      },
+    });
+  } catch (err) {
+    console.error(err.message);
+    bot.sendMessage(chatId, "Error generating report.");
+  }
+}
+
+// === FINAL OUTPUT HANDLER (Text / CSV / Both) ===
+bot.on("callback_query", async (query) => {
+  const chatId = query.message.chat.id;
+
+  if (
+    query.data === "report_text" ||
+    query.data === "report_csv" ||
+    query.data === "report_both"
+  ) {
+    const rows = lastReports[chatId];
+    if (!rows) {
+      return bot.answerCallbackQuery(query.id, {
+        text: "⚠ Please generate a report first.",
+      });
+    }
+
+    // Group tasks daywise
+    const grouped = {};
+    rows.forEach((row) => {
+      const day = new Date(row.created_at).toLocaleDateString("en-IN", {
+        weekday: "long",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+      });
+      if (!grouped[day]) grouped[day] = [];
+      grouped[day].push(row);
+    });
+
+    // Build text report
+    let textReport = "📊 *Your Task Report (Day-wise)* 📊\n\n";
+    for (const [day, tasks] of Object.entries(grouped)) {
+      textReport += `📅 *${day}*\n`;
+
+      if (tasks.length === 1 && tasks[0].task === "Mandatory Day Off") {
+        textReport += `   🌴 Mandatory Day Off\n\n`;
+        continue;
+      }
+
+      if (tasks.length === 1 && tasks[0].task === "No Tasks Uploaded") {
+        textReport += `   ❌ No tasks uploaded\n`;
+        textReport += `      ⚠ Reason: ${tasks[0].reason || "Not provided"}\n\n`;
+        continue;
+      }
+
+      tasks.forEach((row, idx) => {
+        const status = row.completed ? "✅" : "❌";
+        textReport += `   ${idx + 1}. ${row.task} ${status}\n`;
+        if (!row.completed) {
+          textReport += `      ⚠ Reason: ${row.reason || "Not provided"}\n`;
+        }
+      });
+
+      textReport += `\n`;
+    }
+
+    // CSV
+    const csv = parse(rows, {
+      fields: ["task", "completed", "reason", "created_at"],
+    });
+
+    // Send depending on choice
+    if (query.data === "report_text") {
+      await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
+    } else if (query.data === "report_csv") {
+      await bot.sendDocument(
+        chatId,
+        Buffer.from(csv),
+        {},
+        { filename: `report_${chatId}.csv` }
+      );
+    } else if (query.data === "report_both") {
+      await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
+      await bot.sendDocument(
+        chatId,
+        Buffer.from(csv),
+        {},
+        { filename: `report_${chatId}.csv` }
+      );
+    }
+
+    bot.answerCallbackQuery(query.id, { text: "Report ready ✅" });
+  }
+});
+
 
 /* -------------------------
    Errors & process signals
