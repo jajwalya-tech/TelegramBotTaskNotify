@@ -1273,60 +1273,51 @@ bot.on("callback_query", async (query) => {
       fields: ["date", "description", "completed", "reason", "created_at", "local_id"],
     });*/
     
-   // CSV generation - fix the stringify call
-    const csv = stringify(rows, {
+
+     // CSV - fix the format to be more compatible
+    const csvData = rows.map(row => ({
+      Date: row.date,
+      Description: row.description,
+      Completed: row.completed ? 'Yes' : 'No',
+      Reason: row.reason || '',
+      'Created At': row.created_at,
+      'Task Number': row.local_id || ''
+    }));
+
+    const csv = stringify(csvData, {
       header: true,
-      columns: [
-        { key: 'date', header: 'Date' },
-        { key: 'description', header: 'Description' },
-        { key: 'completed', header: 'Completed' },
-        { key: 'reason', header: 'Reason' },
-        { key: 'created_at', header: 'Created At' },
-        { key: 'local_id', header: 'Task Number' }
-      ]
+      columns: ['Date', 'Description', 'Completed', 'Reason', 'Created At', 'Task Number']
     });
 
+    // Create a proper file buffer with explicit encoding
+    const csvBuffer = Buffer.from(csv, 'utf8');
+    const filename = `task_report_${new Date().toISOString().split('T')[0]}.csv`;
 
+    try {
+      // Send depending on choice with updated file sending method
+      if (query.data === "report_text") {
+        await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
+      } else if (query.data === "report_csv") {
+        // Send CSV as document using the new method
+        await bot.sendDocument(chatId, csvBuffer, {}, {
+          filename: filename,
+          contentType: 'text/csv'
+        });
+      } else if (query.data === "report_both") {
+        await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
+        // Send CSV as document using the new method
+        await bot.sendDocument(chatId, csvBuffer, {}, {
+          filename: filename,
+          contentType: 'text/csv'
+        });
+      }
 
-    // Send depending on choice
-    if (query.data === "report_text") {
-      await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
-    } else if (query.data === "report_csv") {
-      /*await bot.sendDocument(
-        chatId,
-        Buffer.from(csv),
-        {},
-        { filename: `report_${chatId}.csv` }
-      );*/
-      // Send CSV as document
-        await bot.sendDocument(
-          chatId,
-          Buffer.from(csv),
-          {
-            filename: `task_report_${new Date().toISOString().split('T')[0]}.csv`,
-            caption: "Here's your task report CSV file"
-          }
-        );
-    } else if (query.data === "report_both") {
-      await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
-      /*await bot.sendDocument(
-        chatId,
-        Buffer.from(csv),
-        {},
-        { filename: `report_${chatId}.csv` }
-      );*/
-      // Send CSV as document
-        await bot.sendDocument(
-          chatId,
-          Buffer.from(csv),
-          {
-            filename: `task_report_${new Date().toISOString().split('T')[0]}.csv`,
-            caption: "Here's your task report CSV file"
-          }
-        );
+      bot.answerCallbackQuery(query.id, { text: "Report ready ✅" });
+    } catch (err) {
+      console.error('Error sending report:', err);
+      bot.answerCallbackQuery(query.id, { text: "Error sending report" });
+      bot.sendMessage(chatId, "Error sending report. Please try again.");
     }
-
-    bot.answerCallbackQuery(query.id, { text: "Report ready ✅" });
   }
 });
 
