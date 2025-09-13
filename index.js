@@ -351,11 +351,11 @@ const messages =  {
     '🌠 Evening focus, {name}.\n\n"Try to be a rainbow in someone\'s cloud.\" — Maya Angelou',
   ],
   endOfDay: [
-  '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Peace comes from within. Do not seek it without.\" — Buddha',
-  '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Do not go where the path may lead, go instead where there is no path and leave a trail.\" — Ralph Waldo Emerson',
-  '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"The wound is the place where the Light enters you.\" — Rumi',
-  '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
-  '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
+  '🌌 That\'s a wrap {name}! Before you go:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Peace comes from within. Do not seek it without.\" — Buddha',
+  '🌠 Day finished {name}. Tasks:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Do not go where the path may lead, go instead where there is no path and leave a trail.\" — Ralph Waldo Emerson',
+  '😴 Time to rest, {name}. Review your day:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"The wound is the place where the Light enters you.\" — Rumi',
+  '🌙 Well done {name}. Wrap up your tasks:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
+  '💤 Rest easy, {name}. Reflect on your progress:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
 ],
   mandatoryDayOff: [
     '🌴 Today is your mandatory day off {name}! Time to relax and recharge.\n\n"Rest when you\'re weary. Refresh and renew yourself, your body, your mind, your spirit. Then get back to work." — Ralph Marston',
