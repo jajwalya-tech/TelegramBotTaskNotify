@@ -1269,15 +1269,15 @@ bot.on("callback_query", async (query) => {
     }
 
     // CSV
-   /* const csv = stringify(rows, {
+   const csv = parse(rows, {
       fields: ["date", "description", "completed", "reason", "created_at", "local_id"],
-    });*/
+    });
     
     //FIXED CSV
-    const csv = stringify(rows, {
+    /*const csv = stringify(rows, {
   header: true,
   columns: ["date", "description", "completed", "reason", "created_at", "local_id"]
-});
+});*/
 
 
     // Send depending on choice
