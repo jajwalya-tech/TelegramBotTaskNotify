@@ -1,4 +1,3 @@
-
 /** 
  * Telegram Task/Reminder Bot
  *
@@ -11,6 +10,8 @@
  *  - Auto-create user row on /addtask to avoid FK errors
  *  - Railway deployment fixes (IPv6/SSL handling)
  *  - Force IPv4 connections for Railway compatibility
+ *  - Daily task numbering (resets to 1 each day)
+ *  - Date-based sorting for reports
  *
  * ENV VARS (required):
  *   BOT_TOKEN        - Telegram bot token
@@ -237,6 +238,34 @@ async function initTables() {
       console.log('ℹ️ Columns already exist or could not be added:', err.message);
     }
     
+    // Migration for local_id column
+    try {
+      await client.query(`
+        ALTER TABLE tasks 
+        ADD COLUMN IF NOT EXISTS local_id INTEGER DEFAULT NULL
+      `);
+      console.log('✅ Added local_id column if needed');
+      
+      // Populate local_id for existing tasks that don't have it
+      const updateResult = await client.query(`
+        WITH numbered_tasks AS (
+          SELECT id, 
+                 ROW_NUMBER() OVER (PARTITION BY chat_id, date ORDER BY created_at ASC, id ASC) as new_local_id
+          FROM tasks 
+          WHERE local_id IS NULL
+        )
+        UPDATE tasks t
+        SET local_id = nt.new_local_id
+        FROM numbered_tasks nt
+        WHERE t.id = nt.id
+      `);
+      
+      console.log(`✅ Populated local_id for ${updateResult.rowCount} existing tasks`);
+      
+    } catch (err) {
+      console.log('ℹ️ local_id column already exists or could not be populated:', err.message);
+    }
+    
     console.log('✅ Database tables initialized');
   } catch (err) {
     console.error('❌ Database init error', err);
@@ -245,6 +274,50 @@ async function initTables() {
     client.release();
   }
 
+}
+
+/* -------------------------
+   Daily Task Numbering Helpers
+   ------------------------- */
+
+// Get daily sequence number for a task
+async function getDailyTaskNumber(chatId, taskId, date) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT local_id FROM tasks WHERE id=$1 AND chat_id=$2 AND date=$3`,
+      [taskId, chatId, date]
+    );
+    return rows.length ? rows[0].local_id : taskId; // fallback to database ID
+  } catch (err) {
+    console.error('getDailyTaskNumber error', err);
+    return taskId; // fallback to database ID
+  }
+}
+
+// Get database ID from daily sequence number
+async function getTaskIdFromDailyNumber(chatId, dailyNumber, date) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id FROM tasks WHERE chat_id=$1 AND date=$2 AND local_id=$3`,
+      [chatId, date, dailyNumber]
+    );
+    return rows.length ? rows[0].id : null;
+  } catch (err) {
+    console.error('getTaskIdFromDailyNumber error', err);
+    return null;
+  }
+}
+
+// Format tasks with daily numbering
+async function formatTasksWithDailyNumbers(chatId, tasks, date) {
+  if (!tasks || !tasks.length) return 'No tasks for today.';
+  
+  return tasks.map((task) => {
+    const dailyNumber = task.local_id || '?';
+    const status = task.completed ? '✅' : '❌';
+    const reason = task.reason ? ' — ' + task.reason : '';
+    return `${dailyNumber}. ${task.description} ${status}${reason}`;
+  }).join('\n');
 }
 
 /* -------------------------
@@ -442,10 +515,10 @@ async function scheduleAllForUser(user) {
         
         const today = localDateStr(tzName, 0);
         const { rows } = await pool.query(
-          `SELECT id, description, completed FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`,
+          `SELECT id, description, completed, local_id FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY local_id ASC`,
           [chatId, today]
         );
-        let tasksStr = rows.length ? rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}`).join('\n') : 'No tasks for today.';
+        let tasksStr = await formatTasksWithDailyNumbers(chatId, rows, today);
         enqueueMessage(chatId, pickMessage('startOfDay', name, tasksStr));
       } catch (err) {
         console.error('startOfDay job error', err);
@@ -512,13 +585,10 @@ async function scheduleAllForUser(user) {
         }
         
         const { rows } = await pool.query(
-          `SELECT id, description, completed FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`,
+          `SELECT id, description, completed, local_id FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY local_id ASC`,
           [chatId, today]
         );
-        const incomplete = rows.filter(r => !r.completed);
-        let tasksStr;
-        if (rows.length === 0) tasksStr = 'No tasks were added today.';
-        else tasksStr = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}`).join('\n');
+        let tasksStr = await formatTasksWithDailyNumbers(chatId, rows, today);
 
         enqueueMessage(chatId, pickMessage('endOfDay', name, tasksStr));
       } catch (err) {
@@ -557,9 +627,9 @@ bot.onText(/\/start|\/help/, (msg) => {
     '/register <name> - register yourself',
     '/addtask <task> - add task for today',
     '/tomorrow <t1; t2; ...> - add tasks for tomorrow',
-    '/markcomplete <task_id> - mark a task complete',
-    '/markincomplete <task_id> - mark a task incomplete',
-    '/reason <task_id> <reason> - add reason for incomplete task',
+    '/markcomplete <task_number> - mark a task complete (daily number)',
+    '/markincomplete <task_number> - mark a task incomplete (daily number)',
+    '/reason <task_number> <reason> - add reason for incomplete task (daily number)',
     '/noreason <reason> - declare no tasks were added but give reason',
     '/settime startOfDay:07:00;morning:08:30;afternoon:14:30;evening:19:30;endOfDay:22:00 - change times',
     '/setinterval <days> - set mandatory day off interval (e.g., 15)',
@@ -568,6 +638,8 @@ bot.onText(/\/start|\/help/, (msg) => {
     '/report weekly|monthly - get CSV report',
     '/today - list today tasks',
     '/deleteuser - delete your account and all data',
+    '',
+    'Note: Task numbers reset to 1 each day'
   ].join('\n');
   bot.sendMessage(chatId, helpText);
 });
@@ -613,12 +685,23 @@ bot.onText(/\/addtask (.+)/, async (msg, match) => {
     // Ensure user row exists to avoid FK error
     await pool.query(`INSERT INTO users (chat_id, timezone, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT DO NOTHING`, [chatId, DEFAULT_TZ]);
 
-    const res = await pool.query(
-      `INSERT INTO tasks (chat_id, date, description) VALUES ($1,$2,$3) RETURNING id`,
-      [chatId, date, description]
+    // Get next local_id for this date
+    const countResult = await pool.query(
+      `SELECT COALESCE(MAX(local_id), 0) + 1 as next_local_id FROM tasks WHERE chat_id=$1 AND date=$2`,
+      [chatId, date]
     );
-    const id = res.rows[0].id;
-    return bot.sendMessage(chatId, `Added task #${id}: ${description}`);
+    const nextLocalId = countResult.rows[0].next_local_id;
+
+    const res = await pool.query(
+      `INSERT INTO tasks (chat_id, date, description, local_id) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [chatId, date, description, nextLocalId]
+    );
+    const taskId = res.rows[0].id;
+    
+    // Get daily number for this task
+    const dailyNumber = nextLocalId;
+    
+    return bot.sendMessage(chatId, `Added task #${dailyNumber}: ${description}`);
   } catch (err) {
     console.error('/addtask error', err);
     return bot.sendMessage(chatId, 'Failed to add task. Please try again.');
@@ -637,7 +720,20 @@ bot.onText(/\/tomorrow (.+)/, async (msg, match) => {
   try {
     await pool.query(`INSERT INTO users (chat_id, timezone, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT DO NOTHING`, [chatId, DEFAULT_TZ]);
 
-    const insertPromises = parts.map(desc => pool.query(`INSERT INTO tasks (chat_id, date, description) VALUES ($1,$2,$3)`, [chatId, date, desc]));
+    // Get starting local_id for tomorrow's tasks
+    const countResult = await pool.query(
+      `SELECT COALESCE(MAX(local_id), 0) as max_local_id FROM tasks WHERE chat_id=$1 AND date=$2`,
+      [chatId, date]
+    );
+    let nextLocalId = parseInt(countResult.rows[0].max_local_id) + 1;
+
+    const insertPromises = parts.map(desc => {
+      const localId = nextLocalId++;
+      return pool.query(
+        `INSERT INTO tasks (chat_id, date, description, local_id) VALUES ($1,$2,$3,$4)`,
+        [chatId, date, desc, localId]
+      );
+    });
     await Promise.all(insertPromises);
     return bot.sendMessage(chatId, `Added ${parts.length} tasks for ${date}.`);
   } catch (err) {
@@ -648,29 +744,42 @@ bot.onText(/\/tomorrow (.+)/, async (msg, match) => {
 
 bot.onText(/\/markcomplete (\d+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
-  const id = Number(match[1]);
-  if (!id) return bot.sendMessage(chatId, 'Provide a valid task id: /markcomplete 123');
+  const dailyNumber = Number(match[1]);
+  if (!dailyNumber) return bot.sendMessage(chatId, 'Provide a valid task number: /markcomplete 1');
 
+  const date = localDateStr(DEFAULT_TZ, 0);
   try {
-    const res = await pool.query(`UPDATE tasks SET completed = TRUE, updated_at = NOW() WHERE id=$1 AND chat_id=$2 RETURNING description`, [id, chatId]);
-    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task ${id} found.`);
-    return bot.sendMessage(chatId, `Marked task ${id} complete: ${res.rows[0].description}`);
+    // Convert daily number to database ID
+    const taskId = await getTaskIdFromDailyNumber(chatId, dailyNumber, date);
+    if (!taskId) {
+      return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    }
+
+    const res = await pool.query(`UPDATE tasks SET completed = TRUE, updated_at = NOW() WHERE id=$1 AND chat_id=$2 RETURNING description`, [taskId, chatId]);
+    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    return bot.sendMessage(chatId, `Marked task #${dailyNumber} complete: ${res.rows[0].description}`);
   } catch (err) {
     console.error('/markcomplete error', err);
     return bot.sendMessage(chatId, 'Failed to mark complete. Try again later.');
   }
 });
 
-// Add markincomplete command
 bot.onText(/\/markincomplete (\d+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
-  const id = Number(match[1]);
-  if (!id) return bot.sendMessage(chatId, 'Provide a valid task id: /markincomplete 123');
+  const dailyNumber = Number(match[1]);
+  if (!dailyNumber) return bot.sendMessage(chatId, 'Provide a valid task number: /markincomplete 1');
 
+  const date = localDateStr(DEFAULT_TZ, 0);
   try {
-    const res = await pool.query(`UPDATE tasks SET completed = FALSE, updated_at = NOW() WHERE id=$1 AND chat_id=$2 RETURNING description`, [id, chatId]);
-    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task ${id} found.`);
-    return bot.sendMessage(chatId, `Marked task ${id} incomplete: ${res.rows[0].description}`);
+    // Convert daily number to database ID
+    const taskId = await getTaskIdFromDailyNumber(chatId, dailyNumber, date);
+    if (!taskId) {
+      return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    }
+
+    const res = await pool.query(`UPDATE tasks SET completed = FALSE, updated_at = NOW() WHERE id=$1 AND chat_id=$2 RETURNING description`, [taskId, chatId]);
+    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    return bot.sendMessage(chatId, `Marked task #${dailyNumber} incomplete: ${res.rows[0].description}`);
   } catch (err) {
     console.error('/markincomplete error', err);
     return bot.sendMessage(chatId, 'Failed to mark incomplete. Try again later.');
@@ -679,14 +788,21 @@ bot.onText(/\/markincomplete (\d+)/, async (msg, match) => {
 
 bot.onText(/\/reason (\d+)\s+(.+)/, async (msg, match) => {
   const chatId = String(msg.chat.id);
-  const id = Number(match[1]);
+  const dailyNumber = Number(match[1]);
   const reason = (match[2] || '').trim();
-  if (!id || !reason) return bot.sendMessage(chatId, 'Usage: /reason <task_id> <reason>');
+  if (!dailyNumber || !reason) return bot.sendMessage(chatId, 'Usage: /reason <task_number> <reason>');
 
+  const date = localDateStr(DEFAULT_TZ, 0);
   try {
-    const res = await pool.query(`UPDATE tasks SET reason=$1, updated_at=NOW() WHERE id=$2 AND chat_id=$3 RETURNING id`, [reason, id, chatId]);
-    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task ${id} found for you.`);
-    return bot.sendMessage(chatId, `Saved reason for task ${id}.`);
+    // Convert daily number to database ID
+    const taskId = await getTaskIdFromDailyNumber(chatId, dailyNumber, date);
+    if (!taskId) {
+      return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    }
+
+    const res = await pool.query(`UPDATE tasks SET reason=$1, updated_at=NOW() WHERE id=$2 AND chat_id=$3 RETURNING id`, [reason, taskId, chatId]);
+    if (res.rowCount === 0) return bot.sendMessage(chatId, `No task #${dailyNumber} found for today.`);
+    return bot.sendMessage(chatId, `Saved reason for task #${dailyNumber}.`);
   } catch (err) {
     console.error('/reason error', err);
     return bot.sendMessage(chatId, 'Failed to save reason. Try again later.');
@@ -699,7 +815,20 @@ bot.onText(/\/noreason (.+)/, async (msg, match) => {
   const date = localDateStr(DEFAULT_TZ, 0);
   try {
     await pool.query(`INSERT INTO users (chat_id, timezone, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT DO NOTHING`, [chatId, DEFAULT_TZ]);
-    await pool.query(`INSERT INTO tasks (chat_id, date, description, completed, reason) VALUES ($1,$2,$3,true,$4)`, [chatId, date, 'No tasks added today', reason]);
+    
+    // Get next local_id for this date like in /addtask and /tomorrow
+    const countResult = await pool.query(
+      `SELECT COALESCE(MAX(local_id), 0) + 1 as next_local_id FROM tasks WHERE chat_id=$1 AND date=$2`,
+      [chatId, date]
+    );
+    const nextLocalId = countResult.rows[0].next_local_id;
+
+    await pool.query(
+      `INSERT INTO tasks (chat_id, date, description, completed, reason, local_id) 
+       VALUES ($1,$2,$3,true,$4,$5)`,
+      [chatId, date, 'No tasks added today', reason, nextLocalId]
+    );
+    
     return bot.sendMessage(chatId, 'Noted — no tasks today. Thanks!');
   } catch (err) {
     console.error('/noreason error', err);
@@ -896,9 +1025,10 @@ bot.onText(/\/today/, async (msg) => {
   const chatId = String(msg.chat.id);
   const date = localDateStr(DEFAULT_TZ, 0);
   try {
-    const { rows } = await pool.query(`SELECT id, description, completed, reason FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY id`, [chatId, date]);
+    const { rows } = await pool.query(`SELECT id, description, completed, reason, local_id FROM tasks WHERE chat_id=$1 AND date=$2 ORDER BY local_id ASC`, [chatId, date]);
     if (!rows.length) return bot.sendMessage(chatId, `No tasks for today (${date}).`);
-    const text = rows.map(r => `${r.id}. ${r.description} ${r.completed ? '✅' : '❌'}${r.reason ? ' — ' + r.reason : ''}`).join('\n');
+    
+    const text = await formatTasksWithDailyNumbers(chatId, rows, date);
     return bot.sendMessage(chatId, `Tasks for ${date}:\n${text}`);
   } catch (err) {
     console.error('/today error', err);
@@ -1042,16 +1172,16 @@ bot.on("message", async (msg) => {
 // === REPORT GENERATION FUNCTION ===
 async function sendReport(chatId, startDate, endDate) {
   try {
-    let query = `SELECT description, completed, reason, created_at
+    let query = `SELECT description, completed, reason, date, created_at, local_id
                  FROM tasks 
                  WHERE chat_id = $1`;
     const params = [chatId];
 
     if (startDate && endDate) {
-      query += ` AND created_at BETWEEN $2 AND $3 ORDER BY created_at ASC`;
-      params.push(startDate, endDate);
+      query += ` AND date BETWEEN $2 AND $3 ORDER BY date ASC, local_id ASC`;
+      params.push(startDate.toISOString().split('T')[0], endDate.toISOString().split('T')[0]);
     } else {
-      query += ` ORDER BY created_at ASC`;
+      query += ` ORDER BY date ASC, local_id ASC`;
     }
 
     const result = await pool.query(query, params);
@@ -1095,10 +1225,10 @@ bot.on("callback_query", async (query) => {
       });
     }
 
-    // Group tasks daywise
+    // Group tasks by date instead of created_at
     const grouped = {};
     rows.forEach((row) => {
-      const day = new Date(row.created_at).toLocaleDateString("en-IN", {
+      const day = new Date(row.date).toLocaleDateString("en-IN", {
         weekday: "long",
         day: "2-digit",
         month: "short",
@@ -1118,15 +1248,18 @@ bot.on("callback_query", async (query) => {
         continue;
       }
 
-      if (tasks.length === 1 && tasks[0].description === "No Tasks Uploaded") {
+      if (tasks.length === 1 && tasks[0].description === "No tasks added today") {
         textReport += `   ❌ No tasks uploaded\n`;
         textReport += `      ⚠ Reason: ${tasks[0].reason || "Not provided"}\n\n`;
         continue;
       }
 
+      // Sort tasks by local_id within each day for consistent numbering
+      tasks.sort((a, b) => (a.local_id || 0) - (b.local_id || 0));
+      
       tasks.forEach((row, idx) => {
         const status = row.completed ? "✅" : "❌";
-        textReport += `   ${idx + 1}. ${row.description} ${status}\n`;
+        textReport += `   ${row.local_id || (idx + 1)}. ${row.description} ${status}\n`;
         if (!row.completed) {
           textReport += `      ⚠ Reason: ${row.reason || "Not provided"}\n`;
         }
@@ -1137,7 +1270,7 @@ bot.on("callback_query", async (query) => {
 
     // CSV
     const csv = stringify(rows, {
-      fields: ["description", "completed", "reason", "created_at"],
+      fields: ["date", "description", "completed", "reason", "created_at", "local_id"],
     });
 
     // Send depending on choice
