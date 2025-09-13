@@ -1269,35 +1269,61 @@ bot.on("callback_query", async (query) => {
     }
 
     // CSV
-   const csv = parse(rows, {
+   /*const csv = stringify(rows, {
       fields: ["date", "description", "completed", "reason", "created_at", "local_id"],
-    });
+    });*/
     
-    //FIXED CSV
-    /*const csv = stringify(rows, {
-  header: true,
-  columns: ["date", "description", "completed", "reason", "created_at", "local_id"]
-});*/
+   // CSV generation - fix the stringify call
+    const csv = stringify(rows, {
+      header: true,
+      columns: [
+        { key: 'date', header: 'Date' },
+        { key: 'description', header: 'Description' },
+        { key: 'completed', header: 'Completed' },
+        { key: 'reason', header: 'Reason' },
+        { key: 'created_at', header: 'Created At' },
+        { key: 'local_id', header: 'Task Number' }
+      ]
+    });
+
 
 
     // Send depending on choice
     if (query.data === "report_text") {
       await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
     } else if (query.data === "report_csv") {
-      await bot.sendDocument(
+      /*await bot.sendDocument(
         chatId,
         Buffer.from(csv),
         {},
         { filename: `report_${chatId}.csv` }
-      );
+      );*/
+      // Send CSV as document
+        await bot.sendDocument(
+          chatId,
+          Buffer.from(csv),
+          {
+            filename: `task_report_${new Date().toISOString().split('T')[0]}.csv`,
+            caption: "Here's your task report CSV file"
+          }
+        );
     } else if (query.data === "report_both") {
       await bot.sendMessage(chatId, textReport, { parse_mode: "Markdown" });
-      await bot.sendDocument(
+      /*await bot.sendDocument(
         chatId,
         Buffer.from(csv),
         {},
         { filename: `report_${chatId}.csv` }
-      );
+      );*/
+      // Send CSV as document
+        await bot.sendDocument(
+          chatId,
+          Buffer.from(csv),
+          {
+            filename: `task_report_${new Date().toISOString().split('T')[0]}.csv`,
+            caption: "Here's your task report CSV file"
+          }
+        );
     }
 
     bot.answerCallbackQuery(query.id, { text: "Report ready ✅" });
