@@ -1,4 +1,4 @@
-/** 
+/**
  * Telegram Task/Reminder Bot
  *
  * Patches applied:
@@ -12,6 +12,7 @@
  *  - Force IPv4 connections for Railway compatibility
  *  - Daily task numbering (resets to 1 each day)
  *  - Date-based sorting for reports
+ *  - Fixed mandatory day off functionality with proper modulo calculation
  *
  * ENV VARS (required):
  *   BOT_TOKEN        - Telegram bot token
@@ -351,11 +352,11 @@ const messages =  {
     '🌠 Evening focus, {name}.\n\n"Try to be a rainbow in someone\'s cloud.\" — Maya Angelou',
   ],
   endOfDay: [
-  '🌌 That\'s a wrap {name}! Before you go:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Peace comes from within. Do not seek it without.\" — Buddha',
-  '🌠 Day finished {name}. Tasks:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Do not go where the path may lead, go instead where there is no path and leave a trail.\" — Ralph Waldo Emerson',
-  '😴 Time to rest, {name}. Review your day:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"The wound is the place where the Light enters you.\" — Rumi',
-  '🌙 Well done {name}. Wrap up your tasks:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
-  '💤 Rest easy, {name}. Reflect on your progress:\n{tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
+  '🌌 That\'s a wrap {name}! Before you go: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Peace comes from within. Do not seek it without.\" — Buddha',
+  '🌠 Day finished {name}. Tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Do not go where the path may lead, go instead where there is no path and leave a trail.\" — Ralph Waldo Emerson',
+  '😴 Time to rest, {name}. Review your day: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"The wound is the place where the Light enters you.\" — Rumi',
+  '🌙 Well done {name}. Wrap up your tasks: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Every day I discover more and more beautiful things. My head is bursting with the desire to do everything.\" — Claude Monet',
+  '💤 Rest easy, {name}. Reflect on your progress: {tasks}\n\n✅ Please add reasons via /reason or say /noreason if none.\n📝 Don\'t forget to add tomorrow\'s tasks with /tomorrow\n\n"Happiness is not something ready made. It comes from your own actions.\" — Dalai Lama',
 ],
   mandatoryDayOff: [
     '🌴 Today is your mandatory day off {name}! Time to relax and recharge.\n\n"Rest when you\'re weary. Refresh and renew yourself, your body, your mind, your spirit. Then get back to work." — Ralph Marston',
@@ -398,24 +399,22 @@ function parseTimeHHMM(value) {
 // Helper function to check if today is a mandatory day off
 function isMandatoryDayOff(user) {
   if (!user.mandatory_day_off_interval) return false;
-  
-  const today = dayjs().tz(user.timezone || DEFAULT_TZ);
-  
-  // If user has taken a day off before, use that date
+
+  const tz = user.timezone || DEFAULT_TZ;
+  const today = dayjs().tz(tz).startOf('day');
+
   if (user.last_mandatory_day_off) {
-    const lastDayOff = dayjs(user.last_mandatory_day_off).tz(user.timezone || DEFAULT_TZ);
+    const lastDayOff = dayjs(user.last_mandatory_day_off).tz(tz).startOf('day');
     const daysSinceLastOff = today.diff(lastDayOff, 'day');
-    return daysSinceLastOff >= user.mandatory_day_off_interval;
+    return daysSinceLastOff > 0 && daysSinceLastOff % user.mandatory_day_off_interval === 0;
   }
-  
-  // If no day off taken yet, calculate from when interval was set
+
   if (user.interval_set_date) {
-    const intervalStart = dayjs(user.interval_set_date).tz(user.timezone || DEFAULT_TZ);
-    const daysSinceIntervalSet = today.diff(intervalStart, 'day');
-    return daysSinceIntervalSet >= user.mandatory_day_off_interval;
+    const start = dayjs(user.interval_set_date).tz(tz).startOf('day');
+    const daysSinceStart = today.diff(start, 'day');
+    return daysSinceStart > 0 && daysSinceStart % user.mandatory_day_off_interval === 0;
   }
-  
-  // Fallback: if no interval_set_date, use today as start (shouldn't happen)
+
   return false;
 }
 
@@ -580,6 +579,21 @@ async function scheduleAllForUser(user) {
             [today, chatId]
           );
           
+          // Insert placeholder "Mandatory Day Off" task if not already present
+          const existing = await pool.query(
+            `SELECT 1 FROM tasks WHERE chat_id=$1 AND date=$2 AND description='Mandatory Day Off'`,
+            [chatId, today]
+          );
+
+          if (existing.rowCount === 0) {
+            await pool.query(
+              `INSERT INTO tasks (chat_id, date, description, completed, local_id) 
+               VALUES ($1, $2, 'Mandatory Day Off', TRUE, 1)`,
+              [chatId, today]
+            );
+            console.log(`📌 Recorded "Mandatory Day Off" task for ${chatId} on ${today}`);
+          }
+
           enqueueMessage(chatId, pickMessage('endMandatoryDay', name));
           return;
         }
@@ -987,23 +1001,26 @@ bot.onText(/\/showinterval/, async (msg) => {
     if (interval) {
       message += `🔄 Interval: Every ${interval} days\n`;
       
-      let nextOffDate;
       if (lastDayOff) {
-        const lastOffDate = dayjs(lastDayOff).tz(timezone).format('YYYY-MM-DD');
-        nextOffDate = dayjs(lastDayOff).tz(timezone).add(interval, 'day').format('YYYY-MM-DD');
-        const daysUntilNext = interval - dayjs().tz(timezone).diff(dayjs(lastDayOff).tz(timezone), 'day');
-        
-        message += `📆 Last day off: ${lastOffDate}\n`;
+        const lastOffDate = dayjs(lastDayOff).tz(timezone).startOf('day');
+        const today = dayjs().tz(timezone).startOf('day');
+        const daysSince = today.diff(lastOffDate, 'day');
+        const daysUntilNext = interval - (daysSince % interval);
+        const nextOffDate = lastOffDate.add(daysUntilNext, 'day').format('YYYY-MM-DD');
+
+        message += `📆 Last day off: ${lastOffDate.format('YYYY-MM-DD')}\n`;
         message += `⏭️ Next day off: ${nextOffDate}\n`;
-        message += `📋 Days until next: ${Math.max(0, daysUntilNext)}\n`;
+        message += `📋 Days until next: ${daysUntilNext}\n`;
       } else if (intervalSetDate) {
-        const startDate = dayjs(intervalSetDate).tz(timezone).format('YYYY-MM-DD');
-        nextOffDate = dayjs(intervalSetDate).tz(timezone).add(interval, 'day').format('YYYY-MM-DD');
-        const daysUntilNext = interval - dayjs().tz(timezone).diff(dayjs(intervalSetDate).tz(timezone), 'day');
+        const startDate = dayjs(intervalSetDate).tz(timezone).startOf('day');
+        const today = dayjs().tz(timezone).startOf('day');
+        const daysSinceStart = today.diff(startDate, 'day');
+        const daysUntilNext = interval - (daysSinceStart % interval);
+        const nextOffDate = startDate.add(daysSinceStart + daysUntilNext, 'day').format('YYYY-MM-DD');
         
-        message += `📆 Interval started: ${startDate}\n`;
+        message += `📆 Interval started: ${startDate.format('YYYY-MM-DD')}\n`;
         message += `⏭️ First day off: ${nextOffDate}\n`;
-        message += `📋 Days until first: ${Math.max(0, daysUntilNext)}\n`;
+        message += `📋 Days until first: ${daysUntilNext}\n`;
       } else {
         message += `📆 Status: Ready for first day off\n`;
       }
@@ -1377,6 +1394,45 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     });
     await testDatabaseConnection();
     await initTables();
+
+    // Backfill mandatory day off data for existing users
+    (async function backfillMandatoryDayOffs() {
+      try {
+        const { rows } = await pool.query(`
+          SELECT chat_id, mandatory_day_off_interval, interval_set_date, last_mandatory_day_off, timezone
+          FROM users
+          WHERE mandatory_day_off_interval IS NOT NULL
+            AND interval_set_date IS NOT NULL
+            AND last_mandatory_day_off IS NULL
+        `);
+
+        for (const user of rows) {
+          const tz = user.timezone || DEFAULT_TZ;
+          const today = dayjs().tz(tz).startOf('day');
+          const start = dayjs(user.interval_set_date).tz(tz).startOf('day');
+          const daysSinceStart = today.diff(start, 'day');
+
+          if (daysSinceStart >= user.mandatory_day_off_interval) {
+            // Calculate most recent valid day-off date
+            const lastOff = start.add(
+              Math.floor(daysSinceStart / user.mandatory_day_off_interval) *
+              user.mandatory_day_off_interval,
+              'day'
+            );
+
+            await pool.query(
+              `UPDATE users SET last_mandatory_day_off=$1, updated_at=NOW() WHERE chat_id=$2`,
+              [lastOff.format('YYYY-MM-DD'), user.chat_id]
+            );
+
+            console.log(`🔧 Backfilled last_mandatory_day_off for user ${user.chat_id} → ${lastOff.format('YYYY-MM-DD')}`);
+          }
+        }
+      } catch (err) {
+        console.error("Backfill mandatory day off error:", err);
+      }
+    })();
+
     // small delay to ensure DB is ready; then reschedule
     setTimeout(rescheduleAll, 2000);
     console.log('✅ Bot started and polling for Telegram updates.');
